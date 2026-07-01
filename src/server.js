@@ -744,6 +744,173 @@ app.get('/api/transactions', (req, res) => {
   return res.json({ period, transactions: rows });
 });
 
+// --- 대시보드 집계 (FR-07·08·10, PRD 2.1·2.2) ------------------------------
+// GET /api/dashboard?period=  (미지정 시 당월)
+// 카테고리(공용) 잔액·팀원(개인) 잔액·전체 소진율·카드별 사용을 한 번에 반환.
+// 산식·개인 할당은 반드시 순수 모듈 computeAllocation(src/budget.js)을 재사용한다
+// (중복 구현 금지 — GET /api/allocation과 동일 방식으로 불변식을 유지).
+//
+// 집계 정의(PRD 2.1·2.2):
+//   카테고리(공용): allocated = period_categories.amount(그 월 스냅샷),
+//     used = Σ transactions(kind='common', 그 period, 해당 period_category_id).amount,
+//     remaining = allocated − used, ratio = used/allocated(allocated=0이면 0). used는 초과 가능(음수 remaining).
+//   팀원(개인): allocation = computeAllocation members[].final(기본+본인조정),
+//     used = Σ transactions(kind='personal', 그 period, 해당 member_id).amount,
+//     remaining = allocation − used, ratio = used/allocation(0이면 0).
+//   전체: total_budget = per_person×N, used_total = 공용+개인, overall_ratio = used_total/total_budget(소진율).
+//   카드(FR-10): 그 period 전체 지출을 card(1/2/null)로 합산.
+//
+// period 처리: 카테고리·totals·cards는 어느 period든 period_categories + transactions로 정확히 계산한다.
+// 팀원별 상세(members)는 당월만 산출한다(과거 월은 active 명단 스냅샷이 없어 신뢰 불가) →
+// 과거 월 members는 빈 배열로 두고 categories·totals·cards만 정확히 반환한다(allocation 엔드포인트와 동일 한계).
+app.get('/api/dashboard', (req, res) => {
+  const period = req.query.period !== undefined ? req.query.period : currentPeriod();
+  if (!isValidPeriod(period)) {
+    return res.status(400).json({ ok: false, error: 'invalid period format' });
+  }
+  ensurePeriod(db, period);
+
+  const meta = db
+    .prepare('SELECT member_count FROM period_meta WHERE period = ?')
+    .get(period);
+  const memberCount = meta ? meta.member_count : 0;
+  const perPerson = db.prepare('SELECT per_person FROM settings WHERE id = 1').get().per_person;
+  const commonTotal = db
+    .prepare('SELECT COALESCE(SUM(amount), 0) AS s FROM period_categories WHERE period = ?')
+    .get(period).s;
+
+  // --- 카테고리(공용) 집계: 스냅샷 배정 − 그 카테고리 공용 지출 합 -----------
+  const categories = db
+    .prepare(
+      `SELECT pc.id AS id, pc.name AS name, pc.amount AS allocated,
+              COALESCE(
+                (SELECT SUM(t.amount) FROM transactions t
+                  WHERE t.kind = 'common' AND t.period = ? AND t.period_category_id = pc.id),
+                0
+              ) AS used
+         FROM period_categories pc
+        WHERE pc.period = ?
+        ORDER BY pc.id`,
+    )
+    .all(period, period)
+    .map((c) => ({
+      id: c.id,
+      name: c.name,
+      allocated: c.allocated,
+      used: c.used,
+      remaining: c.allocated - c.used, // used>allocated 이면 음수(초과)
+      ratio: c.allocated > 0 ? c.used / c.allocated : 0,
+    }));
+
+  // --- 개인 할당: GET /api/allocation과 동일 로직(computeAllocation 단일 소스) -
+  // 당월은 active 팀원별 조정 합으로 상세를 산출하고, 그 합을 adjustments_total로 써 불변식을 보증한다.
+  // 과거 월은 팀원별 상세를 산출하지 않으므로(스냅샷 인원만 신뢰) 전체 조정 합만 aggregate로 사용.
+  let memberAdjustments = [];
+  let adjustmentsTotal;
+  if (period === currentPeriod()) {
+    memberAdjustments = db
+      .prepare(
+        `SELECT m.id AS member_id, m.name AS name,
+                COALESCE(
+                  (SELECT SUM(a.amount) FROM adjustments a
+                    WHERE a.member_id = m.id AND a.period = ?), 0
+                ) AS adjustment
+           FROM members m
+          WHERE m.active = 1
+          ORDER BY m.id`,
+      )
+      .all(period);
+    adjustmentsTotal = memberAdjustments.reduce((sum, m) => sum + m.adjustment, 0);
+  } else {
+    adjustmentsTotal = db
+      .prepare('SELECT COALESCE(SUM(amount), 0) AS s FROM adjustments WHERE period = ?')
+      .get(period).s;
+  }
+
+  const alloc = computeAllocation({
+    perPerson,
+    memberCount,
+    commonTotal,
+    adjustmentsTotal,
+    memberAdjustments,
+  });
+
+  // --- 팀원(개인) 집계: 각 팀원 할당 final − 그 팀원 개인 지출 합 -------------
+  // 과거 월은 alloc.members가 빈 배열이므로 members도 빈 배열(상세 미제공, categories/totals/cards만 정확).
+  const personalUsedRows = db
+    .prepare(
+      `SELECT member_id, SUM(amount) AS used
+         FROM transactions
+        WHERE kind = 'personal' AND period = ?
+        GROUP BY member_id`,
+    )
+    .all(period);
+  const personalUsedByMember = new Map(personalUsedRows.map((r) => [r.member_id, r.used]));
+
+  const members = alloc.members.map((m) => {
+    const used = personalUsedByMember.get(m.member_id) || 0;
+    const allocation = m.final;
+    return {
+      member_id: m.member_id,
+      name: m.name,
+      allocation,
+      used,
+      remaining: allocation - used, // used>allocation 이면 음수(초과)
+      ratio: allocation !== 0 ? used / allocation : 0,
+    };
+  });
+
+  // --- 전체 소진율 --------------------------------------------------------
+  const usedCommon = db
+    .prepare(
+      "SELECT COALESCE(SUM(amount), 0) AS s FROM transactions WHERE kind = 'common' AND period = ?",
+    )
+    .get(period).s;
+  const usedPersonal = db
+    .prepare(
+      "SELECT COALESCE(SUM(amount), 0) AS s FROM transactions WHERE kind = 'personal' AND period = ?",
+    )
+    .get(period).s;
+  const usedTotal = usedCommon + usedPersonal;
+  const totalBudget = alloc.total_budget;
+
+  // --- 카드별 사용(FR-10): 그 period 전체 지출을 카드(1/2/null)로 합산 -------
+  const card1 = db
+    .prepare('SELECT COALESCE(SUM(amount), 0) AS s FROM transactions WHERE period = ? AND card = 1')
+    .get(period).s;
+  const card2 = db
+    .prepare('SELECT COALESCE(SUM(amount), 0) AS s FROM transactions WHERE period = ? AND card = 2')
+    .get(period).s;
+  const cardNone = db
+    .prepare(
+      'SELECT COALESCE(SUM(amount), 0) AS s FROM transactions WHERE period = ? AND card IS NULL',
+    )
+    .get(period).s;
+
+  return res.json({
+    period,
+    per_person: perPerson,
+    member_count: memberCount,
+    total_budget: totalBudget,
+    categories,
+    members,
+    totals: {
+      allocated_common: commonTotal,
+      used_common: usedCommon,
+      used_personal: usedPersonal,
+      used_total: usedTotal,
+      remaining_total: totalBudget - usedTotal,
+      overall_ratio: totalBudget > 0 ? usedTotal / totalBudget : 0,
+    },
+    cards: { card1, card2, none: cardNone },
+    distributable: alloc.distributable,
+    base_allocation: alloc.base_allocation,
+    adjustments_total: alloc.adjustments_total,
+    invariant_ok: alloc.invariant_ok,
+    warning: alloc.warning,
+  });
+});
+
 // 향후 보호 API(/api/*)는 이 아래에 추가한다.
 
 app.listen(PORT, () => {

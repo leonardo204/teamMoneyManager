@@ -77,7 +77,10 @@
       }
       if (summary) summary.hidden = false;
 
-      // T7 이전까지는 콘솔로도 스냅샷을 확인 가능하게 남겨둔다.
+      // 대시보드 본체(T7)를 선택된 기간으로 갱신(탭 진입/기간 변경 시).
+      if (window.__dashboard) window.__dashboard.render(period);
+
+      // 스냅샷을 콘솔로도 확인 가능하게 남겨둔다.
       // eslint-disable-next-line no-console
       console.info('[period] snapshot', {
         period: data.period,
@@ -144,6 +147,10 @@
     if (name === 'settings' && !settingsLoaded && window.__settings) {
       settingsLoaded = true;
       window.__settings.load();
+    }
+    // 대시보드 재진입 시 마지막 선택 기간으로 재렌더(기간 상태는 대시보드 모듈이 보유).
+    if (name === 'dashboard' && window.__dashboard) {
+      window.__dashboard.refresh();
     }
   }
 
@@ -1102,4 +1109,244 @@
   if (refreshBtn) refreshBtn.addEventListener('click', loadRecent);
 
   loadRecent();
+})();
+
+// --- 대시보드 본체 (T7, FR-07·08·10) ---------------------------------------
+// 선택된 기간(period)으로 GET /api/dashboard 를 호출해 전체 소진율·카테고리 카드·
+// 팀원 테이블·카드 집계를 렌더한다. 산식/할당은 서버(computeAllocation) 단일 소스 —
+// 클라이언트는 표시만 한다. 기간 선택(periodPicker)과 탭 전환(tabs)이 render/refresh를 호출한다.
+(function dashboard() {
+  const fmtWon = (n) =>
+    typeof n === 'number' ? n.toLocaleString('ko-KR') + '원' : '–';
+  // 소진율(0..1)을 퍼센트 문자열로. 소수 1자리.
+  const fmtPct = (r) =>
+    Number.isFinite(r) ? (r * 100).toFixed(1) + '%' : '–';
+
+  const setText = (id, text) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = text;
+  };
+
+  // ≥80% 임박, 초과(사용>배정)는 danger. 카테고리·팀원 상태 배지 공통 규칙.
+  function statusClass(used, allocated) {
+    if (used > allocated) return 'danger'; // 초과
+    const ratio = allocated > 0 ? used / allocated : 0;
+    if (ratio >= 0.8) return 'warn'; // 임박
+    return 'ok'; // 여유
+  }
+  function statusLabel(cls) {
+    return cls === 'danger' ? '초과' : cls === 'warn' ? '임박' : '여유';
+  }
+
+  async function api(path) {
+    const res = await fetch(path, { headers: { Accept: 'application/json' } });
+    let data = null;
+    try {
+      data = await res.json();
+    } catch (_) {
+      data = null;
+    }
+    return { res, data };
+  }
+
+  // ---- 전체 요약 · 소진율 ----
+  function renderSummary(d) {
+    const t = d.totals || {};
+    setText('dash-period', d.period || '–');
+    setText('dash-total', fmtWon(d.total_budget));
+    setText('dash-used', fmtWon(t.used_total));
+    setText('dash-remaining', fmtWon(t.remaining_total));
+    setText('dash-used-common', fmtWon(t.used_common));
+    setText('dash-used-personal', fmtWon(t.used_personal));
+
+    const ratio = typeof t.overall_ratio === 'number' ? t.overall_ratio : 0;
+    setText('dash-ratio', fmtPct(ratio));
+
+    const fill = document.getElementById('dash-progress');
+    if (fill) {
+      const pct = Math.max(0, Math.min(100, ratio * 100));
+      fill.style.width = pct + '%';
+      const over = ratio > 1;
+      const warn = !over && ratio >= 0.8;
+      fill.classList.toggle('over', over);
+      fill.classList.toggle('warn', warn);
+    }
+    const overBadge = document.getElementById('dash-over-badge');
+    if (overBadge) overBadge.hidden = ratio <= 1;
+  }
+
+  // ---- 카테고리 카드 (FR-07) ----
+  function renderCategoryCards(d) {
+    const wrap = document.getElementById('dash-cat-cards');
+    if (!wrap) return;
+    wrap.innerHTML = '';
+    const cats = d.categories || [];
+    if (cats.length === 0) {
+      wrap.innerHTML = '<p class="empty">카테고리 없음</p>';
+      return;
+    }
+    for (const c of cats) {
+      const cls = statusClass(c.used, c.allocated);
+      const card = document.createElement('div');
+      card.className = 'card';
+
+      const head = document.createElement('div');
+      head.style.display = 'flex';
+      head.style.alignItems = 'center';
+      head.style.justifyContent = 'space-between';
+      head.style.gap = '0.5rem';
+      head.style.marginBottom = '0.6rem';
+
+      const nameEl = document.createElement('strong');
+      nameEl.textContent = c.name;
+
+      const badge = document.createElement('span');
+      badge.className = 'badge badge-' + cls;
+      badge.textContent = statusLabel(cls);
+
+      head.appendChild(nameEl);
+      head.appendChild(badge);
+
+      const line = (label, value, danger) => {
+        const row = document.createElement('div');
+        row.style.display = 'flex';
+        row.style.justifyContent = 'space-between';
+        row.style.fontSize = '0.82rem';
+        row.style.marginBottom = '0.25rem';
+        const l = document.createElement('span');
+        l.className = 'muted';
+        l.textContent = label;
+        const v = document.createElement('span');
+        v.style.fontVariantNumeric = 'tabular-nums';
+        if (danger) v.style.color = 'var(--danger)';
+        v.textContent = value;
+        row.appendChild(l);
+        row.appendChild(v);
+        return row;
+      };
+
+      card.appendChild(head);
+      card.appendChild(line('배정', fmtWon(c.allocated)));
+      card.appendChild(line('사용', fmtWon(c.used)));
+      card.appendChild(line('잔액', fmtWon(c.remaining), c.remaining < 0));
+
+      // 카테고리별 소진율 진행바(토큰 색만).
+      const prog = document.createElement('div');
+      prog.className = 'progress';
+      prog.style.marginTop = '0.5rem';
+      const fill = document.createElement('div');
+      fill.className = 'progress-fill' + (cls === 'danger' ? ' over' : cls === 'warn' ? ' warn' : '');
+      fill.style.width = Math.max(0, Math.min(100, (c.ratio || 0) * 100)) + '%';
+      prog.appendChild(fill);
+      card.appendChild(prog);
+
+      const pct = document.createElement('div');
+      pct.className = 'hint';
+      pct.style.marginTop = '0.35rem';
+      pct.style.textAlign = 'right';
+      pct.textContent = '소진율 ' + fmtPct(c.ratio || 0);
+      card.appendChild(pct);
+
+      wrap.appendChild(card);
+    }
+  }
+
+  // ---- 팀원 테이블 (FR-08) ----
+  function renderMemberTable(d) {
+    const body = document.getElementById('dash-member-body');
+    const hint = document.getElementById('dash-member-hint');
+    if (!body) return;
+    body.innerHTML = '';
+    const members = d.members || [];
+
+    if (members.length === 0) {
+      // 과거 월은 팀원별 스냅샷이 없어 상세 미제공(categories/totals/cards는 정확).
+      body.innerHTML =
+        '<tr><td colspan="6" class="empty">당월에서만 팀원별 상세를 제공합니다.</td></tr>';
+      if (hint) {
+        hint.textContent =
+          '과거 월은 팀원 명단 스냅샷이 없어 팀원별 잔액을 표시하지 않습니다(전체·카테고리·카드 집계는 정확).';
+        hint.hidden = false;
+      }
+      return;
+    }
+    if (hint) hint.hidden = true;
+
+    for (const m of members) {
+      const cls = statusClass(m.used, m.allocation);
+      const tr = document.createElement('tr');
+
+      const nameTd = document.createElement('td');
+      nameTd.textContent = m.name;
+
+      const allocTd = document.createElement('td');
+      allocTd.style.textAlign = 'right';
+      allocTd.style.fontVariantNumeric = 'tabular-nums';
+      allocTd.textContent = fmtWon(m.allocation);
+
+      const usedTd = document.createElement('td');
+      usedTd.style.textAlign = 'right';
+      usedTd.style.fontVariantNumeric = 'tabular-nums';
+      usedTd.textContent = fmtWon(m.used);
+
+      const remTd = document.createElement('td');
+      remTd.style.textAlign = 'right';
+      remTd.style.fontVariantNumeric = 'tabular-nums';
+      if (m.remaining < 0) remTd.style.color = 'var(--danger)';
+      remTd.textContent = fmtWon(m.remaining);
+
+      const ratioTd = document.createElement('td');
+      ratioTd.style.textAlign = 'right';
+      ratioTd.style.fontVariantNumeric = 'tabular-nums';
+      if (m.ratio > 1) ratioTd.style.color = 'var(--danger)';
+      ratioTd.textContent = fmtPct(m.ratio || 0);
+
+      const stTd = document.createElement('td');
+      const badge = document.createElement('span');
+      badge.className = 'badge badge-' + cls;
+      badge.textContent = statusLabel(cls);
+      stTd.appendChild(badge);
+
+      tr.appendChild(nameTd);
+      tr.appendChild(allocTd);
+      tr.appendChild(usedTd);
+      tr.appendChild(remTd);
+      tr.appendChild(ratioTd);
+      tr.appendChild(stTd);
+      body.appendChild(tr);
+    }
+  }
+
+  // ---- 카드별 사용 (FR-10) ----
+  function renderCards(d) {
+    const c = d.cards || {};
+    setText('dash-card1', fmtWon(c.card1 || 0));
+    setText('dash-card2', fmtWon(c.card2 || 0));
+    setText('dash-card-none', fmtWon(c.none || 0));
+  }
+
+  // 마지막 렌더 기간(탭 재진입 refresh용).
+  let lastPeriod = null;
+
+  async function render(period) {
+    if (!period) return;
+    lastPeriod = period;
+    try {
+      const { res, data } = await api(`/api/dashboard?period=${period}`);
+      if (!res.ok || !data) throw new Error(`dashboard ${res.status}`);
+      renderSummary(data);
+      renderCategoryCards(data);
+      renderMemberTable(data);
+      renderCards(data);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error('[dashboard] render failed:', err);
+    }
+  }
+
+  function refresh() {
+    if (lastPeriod) render(lastPeriod);
+  }
+
+  window.__dashboard = { render, refresh };
 })();

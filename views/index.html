@@ -12,6 +12,31 @@
 
   <!-- design tokens (부록 B) -->
   <link rel="stylesheet" href="/design-tokens.css" />
+
+  <!-- 대시보드(T7) 전용 보조 스타일 — 색은 토큰(var(--…))만 사용, 하드코딩 hex 금지(NFR-04) -->
+  <style>
+    /* 카테고리 카드 그리드: 넓은 화면은 자동 다단, 좁은 화면(≤640px)은 1단 */
+    .card-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+      gap: 0.8rem;
+    }
+    .card-grid .card { padding: 0.9rem 1rem; }
+    /* 소진율 진행바(토큰 색만) */
+    .progress {
+      height: 10px; background: var(--panel-2);
+      border-radius: 999px; overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%; width: 0; background: var(--accent);
+      border-radius: 999px; transition: width 0.2s ease;
+    }
+    .progress-fill.warn { background: var(--warn); }
+    .progress-fill.over { background: var(--danger); }
+    @media (max-width: 640px) {
+      .card-grid { grid-template-columns: 1fr; }
+    }
+  </style>
 </head>
 <body>
   <header class="app-header">
@@ -59,8 +84,73 @@
 
         <p class="hint" style="margin-top: 0.9rem;">
           월 최초 접근 시 그 시점의 카테고리 템플릿·인원이 스냅샷으로 시드됩니다.
-          대시보드 집계(T7)는 <strong>구현 예정</strong>입니다.
+          선택한 월의 집계는 아래 대시보드에 표시됩니다.
         </p>
+      </section>
+
+      <!-- ===== 전체 요약 · 소진율 (FR-07) ===== -->
+      <section class="panel" id="dash-summary-panel" style="margin-top: 1.1rem;">
+        <div style="display: flex; align-items: center; justify-content: space-between; gap: 0.6rem;">
+          <h2 style="margin: 0;">전체 요약 (<span id="dash-period">–</span>)</h2>
+          <span class="badge badge-danger" id="dash-over-badge" hidden>예산 초과</span>
+        </div>
+        <div style="display: flex; gap: 0.6rem; flex-wrap: wrap; margin-top: 0.9rem;">
+          <span class="chip chip-muted">총예산 <strong id="dash-total" style="font-variant-numeric: tabular-nums;">–</strong></span>
+          <span class="chip chip-muted">총사용 <strong id="dash-used" style="font-variant-numeric: tabular-nums;">–</strong></span>
+          <span class="chip">잔액 <strong id="dash-remaining" style="font-variant-numeric: tabular-nums;">–</strong></span>
+        </div>
+        <div style="margin-top: 1rem;">
+          <div style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 0.4rem;">
+            <span class="section-label" style="margin: 0;">소진율</span>
+            <strong id="dash-ratio" style="font-size: 1.4rem; font-variant-numeric: tabular-nums;">–</strong>
+          </div>
+          <div class="progress" aria-label="전체 소진율">
+            <div class="progress-fill" id="dash-progress"></div>
+          </div>
+          <p class="hint" style="margin-top: 0.5rem;">
+            공용 <strong id="dash-used-common" style="font-variant-numeric: tabular-nums;">–</strong>
+            · 개인 <strong id="dash-used-personal" style="font-variant-numeric: tabular-nums;">–</strong>
+          </p>
+        </div>
+      </section>
+
+      <!-- ===== 카테고리별 잔액 카드 (FR-07) ===== -->
+      <section class="panel" style="margin-top: 1.1rem;">
+        <h2>카테고리별 잔액 (공용, FR-07)</h2>
+        <div id="dash-cat-cards" class="card-grid">
+          <p class="empty">불러오는 중…</p>
+        </div>
+      </section>
+
+      <!-- ===== 팀원별 잔액 테이블 (FR-08) ===== -->
+      <section class="panel" style="margin-top: 1.1rem;">
+        <h2>팀원별 잔액 (개인, FR-08)</h2>
+        <p class="hint" id="dash-member-hint" style="margin: 0 0 0.6rem;" hidden></p>
+        <table class="data" aria-label="팀원별 잔액">
+          <thead>
+            <tr>
+              <th>팀원</th>
+              <th style="text-align: right;">할당</th>
+              <th style="text-align: right;">사용</th>
+              <th style="text-align: right;">잔액</th>
+              <th style="text-align: right;">소진율</th>
+              <th>상태</th>
+            </tr>
+          </thead>
+          <tbody id="dash-member-body">
+            <tr><td colspan="6" class="empty">불러오는 중…</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ===== 카드별 사용 집계 (FR-10) ===== -->
+      <section class="panel" style="margin-top: 1.1rem;">
+        <h2>카드별 사용 (FR-10)</h2>
+        <div style="display: flex; gap: 0.6rem; flex-wrap: wrap;">
+          <span class="chip chip-muted">카드 1 <strong id="dash-card1" style="font-variant-numeric: tabular-nums;">–</strong></span>
+          <span class="chip chip-muted">카드 2 <strong id="dash-card2" style="font-variant-numeric: tabular-nums;">–</strong></span>
+          <span class="chip chip-muted">미지정 <strong id="dash-card-none" style="font-variant-numeric: tabular-nums;">–</strong></span>
+        </div>
       </section>
 
       <!-- 최근 지출 미니 목록 (T6) — 전체 내역·필터·수정은 내역 탭(T8) -->
