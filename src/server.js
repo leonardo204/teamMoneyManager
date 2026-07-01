@@ -11,7 +11,8 @@ import cookieParser from 'cookie-parser';
 import bcrypt from 'bcryptjs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { getDb, DB_PATH } from './db.js';
+import { getDb, DB_PATH, ensurePeriod } from './db.js';
+import { currentPeriod, isValidPeriod } from './period.js';
 import {
   SESSION_COOKIE,
   signSession,
@@ -106,6 +107,74 @@ app.use(requireAuth);
 // 앱 셸(index.html)은 인증 후에만 전송.
 app.get(['/', '/index.html'], (_req, res) => {
   res.sendFile(path.join(VIEWS_DIR, 'index.html'));
+});
+
+// --- 기간·시드 API (FR-11) -------------------------------------------------
+// 회계 단위는 월(YYYY-MM). 월 최초 접근 시 그 시점 템플릿·인원으로 스냅샷 시드(불변).
+
+// 기간 목록 + 당월. 호출 시 당월을 우선 보장(ensurePeriod)한 뒤 존재 월을 최신순으로 반환.
+app.get('/api/periods', (_req, res) => {
+  const current = currentPeriod();
+  ensurePeriod(db, current);
+
+  const rows = db
+    .prepare('SELECT period FROM period_meta ORDER BY period DESC')
+    .all();
+  const periods = rows.map((r) => r.period);
+  if (!periods.includes(current)) {
+    periods.unshift(current);
+    periods.sort((a, b) => (a < b ? 1 : a > b ? -1 : 0)); // 내림차순 유지
+  }
+
+  res.json({ current, periods });
+});
+
+// 해당 월 메타(인원·총예산)만.
+app.get('/api/periods/:period', (req, res) => {
+  const { period } = req.params;
+  if (!isValidPeriod(period)) {
+    return res.status(400).json({ ok: false, error: 'invalid period format' });
+  }
+  ensurePeriod(db, period);
+
+  const meta = db
+    .prepare('SELECT member_count FROM period_meta WHERE period = ?')
+    .get(period);
+  const perPerson = db.prepare('SELECT per_person FROM settings WHERE id = 1').get().per_person;
+  const memberCount = meta ? meta.member_count : 0;
+
+  return res.json({
+    period,
+    member_count: memberCount,
+    per_person: perPerson,
+    total_budget: perPerson * memberCount,
+  });
+});
+
+// 해당 월의 공용 카테고리 스냅샷 + 인원·총예산.
+app.get('/api/periods/:period/categories', (req, res) => {
+  const { period } = req.params;
+  if (!isValidPeriod(period)) {
+    return res.status(400).json({ ok: false, error: 'invalid period format' });
+  }
+  ensurePeriod(db, period);
+
+  const categories = db
+    .prepare('SELECT id, name, amount FROM period_categories WHERE period = ? ORDER BY id')
+    .all(period);
+  const meta = db
+    .prepare('SELECT member_count FROM period_meta WHERE period = ?')
+    .get(period);
+  const perPerson = db.prepare('SELECT per_person FROM settings WHERE id = 1').get().per_person;
+  const memberCount = meta ? meta.member_count : 0;
+
+  return res.json({
+    period,
+    categories,
+    member_count: memberCount,
+    per_person: perPerson,
+    total_budget: perPerson * memberCount,
+  });
 });
 
 // 향후 보호 API(/api/*)는 이 아래에 추가한다.

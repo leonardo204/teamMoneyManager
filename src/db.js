@@ -140,6 +140,50 @@ export function seedDefaults(db) {
   }
 }
 
+/**
+ * 해당 월(period)을 멱등하게 시드한다(FR-11, PRD 2.4·2.5).
+ *
+ * 스냅샷 불변성(핵심): period_meta에 해당 period가 이미 있으면 아무것도 하지 않는다.
+ * 이후 category_templates나 인원이 바뀌어도 기존 월의 스냅샷은 절대 건드리지 않는다.
+ * 오직 최초 진입하는 월만 "그 시점의" active 팀원 수·카테고리 템플릿으로 시드된다.
+ *
+ * 트랜잭션으로 감싸 period_meta insert와 period_categories 복사를 원자적으로 처리한다.
+ * 여러 번 호출해도 중복 행이 생기지 않는다(멱등).
+ *
+ * @param {Database.Database} db
+ * @param {string} period 'YYYY-MM' (형식 검증은 호출부 책임)
+ * @returns {boolean} 이번 호출로 새로 시드했으면 true, 이미 존재해 no-op이면 false
+ */
+export function ensurePeriod(db, period) {
+  const tx = db.transaction((p) => {
+    const existing = db.prepare('SELECT 1 FROM period_meta WHERE period = ?').get(p);
+    if (existing) return false; // 이미 시드됨 → 불변, no-op
+
+    // 그 시점의 active 팀원 수 스냅샷.
+    const memberCount = db
+      .prepare('SELECT COUNT(*) AS n FROM members WHERE active = 1')
+      .get().n;
+
+    db.prepare('INSERT INTO period_meta (period, member_count) VALUES (?, ?)').run(
+      p,
+      memberCount
+    );
+
+    // 그 시점의 category_templates 전체를 period_categories로 복사(공용 카테고리 스냅샷).
+    const templates = db
+      .prepare('SELECT name, default_amount FROM category_templates ORDER BY id')
+      .all();
+    const insertCat = db.prepare(
+      'INSERT INTO period_categories (period, name, amount) VALUES (?, ?, ?)'
+    );
+    for (const t of templates) {
+      insertCat.run(p, t.name, t.default_amount);
+    }
+    return true;
+  });
+  return tx(period);
+}
+
 let _db = null;
 
 /**
