@@ -79,6 +79,8 @@
 
       // 대시보드 본체(T7)를 선택된 기간으로 갱신(탭 진입/기간 변경 시).
       if (window.__dashboard) window.__dashboard.render(period);
+      // 내역 탭(T8)도 같은 선택 기간으로 동기화(기간 선택과 연동).
+      if (window.__history) window.__history.render(period);
 
       // 스냅샷을 콘솔로도 확인 가능하게 남겨둔다.
       // eslint-disable-next-line no-console
@@ -151,6 +153,10 @@
     // 대시보드 재진입 시 마지막 선택 기간으로 재렌더(기간 상태는 대시보드 모듈이 보유).
     if (name === 'dashboard' && window.__dashboard) {
       window.__dashboard.refresh();
+    }
+    // 내역 탭 재진입 시 마지막 선택 기간으로 재렌더.
+    if (name === 'history' && window.__history) {
+      window.__history.refresh();
     }
   }
 
@@ -847,6 +853,8 @@
 
   // 탭 모듈이 최초 진입 시 호출.
   window.__settings = { load };
+  // 커스텀 확인 모달을 다른 모듈(내역 탭 등)에서도 재사용(native confirm 금지).
+  window.__confirm = askConfirm;
 })();
 
 // --- 지출 입력·최근 목록 (T6, FR-06·10) ------------------------------------
@@ -1349,4 +1357,425 @@
   }
 
   window.__dashboard = { render, refresh };
+})();
+
+// --- 내역 탭: 조회·수정·삭제 + 감사 로그 (T8, FR-09·12) ---------------------
+// 선택 기간(대시보드 기간 선택과 연동)의 전체 지출을 목록으로 보여주고, 분류/팀원/카드로
+// 필터한다. 당월 지출만 수정(PUT)·삭제(DELETE) 가능 — 과거 월은 잠금(서버 409, UI 비활성).
+// 수정/삭제 시 서버가 audit_logs에 자동 기록하며, 하단 변경 이력에 최근 로그를 표시한다.
+// 확인은 커스텀 모달 window.__confirm 재사용(native confirm 금지).
+(function history() {
+  const histBody = document.getElementById('hist-body');
+  if (!histBody) return;
+
+  const fmtWon = (n) =>
+    typeof n === 'number' ? n.toLocaleString('ko-KR') + '원' : '–';
+  const cardLabel = (c) => (c === 1 ? '카드 1' : c === 2 ? '카드 2' : '–');
+
+  const openModal = (id) => {
+    const el = document.getElementById(id);
+    if (el) el.hidden = false;
+  };
+  const closeModal = (id) => {
+    const el = document.getElementById(id);
+    if (el) el.hidden = true;
+  };
+  const showMsg = (id, text) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (text) {
+      el.textContent = text;
+      el.hidden = false;
+    } else {
+      el.textContent = '';
+      el.hidden = true;
+    }
+  };
+
+  async function api(path, opts) {
+    const res = await fetch(path, {
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      ...opts,
+    });
+    let data = null;
+    try {
+      data = await res.json();
+    } catch (_) {
+      data = null;
+    }
+    return { res, data };
+  }
+
+  // 내역 상태: 선택 기간·당월·필터·편집 폼(분류/카드).
+  const state = {
+    period: null,
+    current: null,
+    membersLoaded: false,
+    editKind: 'common',
+    editCard: null,
+  };
+
+  const isPastSelected = () =>
+    !!(state.current && state.period && state.period < state.current);
+
+  // 오버레이 클릭·닫기 버튼(수정 모달)은 index.html 공통 배선([data-close], .modal-overlay)에서 처리됨.
+
+  // ---- 필터 요소 ----
+  const filterKind = document.getElementById('hist-filter-kind');
+  const filterMember = document.getElementById('hist-filter-member');
+  const filterCard = document.getElementById('hist-filter-card');
+
+  async function loadMembersForFilter() {
+    // 필터·수정용 팀원 목록. 필터는 비활성 팀원(과거 지출 대상)도 포함해 전체를 싣는다.
+    const { res, data } = await api('/api/members');
+    if (!res.ok || !data) return;
+    const members = data.members || [];
+    if (filterMember) {
+      const keep = filterMember.value;
+      filterMember.innerHTML = '<option value="">전체</option>';
+      for (const m of members) {
+        const opt = document.createElement('option');
+        opt.value = m.id;
+        opt.textContent = m.active ? m.name : `${m.name} (비활성)`;
+        filterMember.appendChild(opt);
+      }
+      filterMember.value = keep;
+    }
+    state.membersLoaded = true;
+  }
+
+  // ---- 목록 렌더 ----
+  function renderList(rows) {
+    histBody.innerHTML = '';
+    if (!rows || rows.length === 0) {
+      histBody.innerHTML = '<tr><td colspan="7" class="empty">지출 없음</td></tr>';
+      return;
+    }
+    const past = isPastSelected();
+    for (const t of rows) {
+      const tr = document.createElement('tr');
+
+      const dateTd = document.createElement('td');
+      dateTd.textContent = t.date;
+
+      const kindTd = document.createElement('td');
+      const badge = document.createElement('span');
+      badge.className = t.kind === 'common' ? 'badge badge-ok' : 'badge badge-warn';
+      badge.textContent = t.kind === 'common' ? '공용' : '개인';
+      kindTd.appendChild(badge);
+
+      const targetTd = document.createElement('td');
+      targetTd.textContent =
+        t.kind === 'common' ? t.category_name || '–' : t.member_name || '–';
+
+      const cardTd = document.createElement('td');
+      cardTd.textContent = cardLabel(t.card);
+
+      const amtTd = document.createElement('td');
+      amtTd.style.textAlign = 'right';
+      amtTd.style.fontVariantNumeric = 'tabular-nums';
+      amtTd.textContent = fmtWon(t.amount);
+
+      const memoTd = document.createElement('td');
+      memoTd.textContent = t.memo || '–';
+
+      const actTd = document.createElement('td');
+      actTd.style.textAlign = 'right';
+      actTd.style.whiteSpace = 'nowrap';
+
+      const editBtn = document.createElement('button');
+      editBtn.className = 'btn';
+      editBtn.type = 'button';
+      editBtn.textContent = '수정';
+      editBtn.disabled = past;
+      editBtn.addEventListener('click', () => openEditModal(t));
+
+      const delBtn = document.createElement('button');
+      delBtn.className = 'btn btn-danger';
+      delBtn.type = 'button';
+      delBtn.textContent = '삭제';
+      delBtn.style.marginLeft = '0.3rem';
+      delBtn.disabled = past;
+      delBtn.addEventListener('click', () => deleteTx(t));
+
+      actTd.appendChild(editBtn);
+      actTd.appendChild(delBtn);
+
+      tr.appendChild(dateTd);
+      tr.appendChild(kindTd);
+      tr.appendChild(targetTd);
+      tr.appendChild(cardTd);
+      tr.appendChild(amtTd);
+      tr.appendChild(memoTd);
+      tr.appendChild(actTd);
+      histBody.appendChild(tr);
+    }
+  }
+
+  async function loadList() {
+    if (!state.period) return;
+    const lbl = document.getElementById('hist-period');
+    if (lbl) lbl.textContent = state.period;
+    const lockNote = document.getElementById('hist-lock-note');
+    if (lockNote) lockNote.hidden = !isPastSelected();
+
+    const qs = new URLSearchParams();
+    qs.set('period', state.period);
+    if (filterKind && filterKind.value) qs.set('kind', filterKind.value);
+    if (filterMember && filterMember.value) qs.set('member_id', filterMember.value);
+    if (filterCard && filterCard.value) qs.set('card', filterCard.value);
+
+    const { res, data } = await api(`/api/transactions?${qs.toString()}`);
+    if (!res.ok || !data) {
+      histBody.innerHTML = '<tr><td colspan="7" class="empty">불러오기 실패</td></tr>';
+      return;
+    }
+    renderList(data.transactions || []);
+  }
+
+  // ---- 감사 로그 ----
+  const auditBody = document.getElementById('audit-body');
+
+  function summarize(log) {
+    // before/after에서 핵심 변화를 요약(금액·분류·대상 위주).
+    if (log.action === 'delete') {
+      const b = log.before || {};
+      return `삭제: ${b.date || ''} ${b.kind === 'common' ? '공용' : '개인'} ${fmtWon(b.amount)}`;
+    }
+    const b = log.before || {};
+    const a = log.after || {};
+    const diffs = [];
+    if (b.amount !== a.amount) diffs.push(`금액 ${fmtWon(b.amount)}→${fmtWon(a.amount)}`);
+    if (b.date !== a.date) diffs.push(`날짜 ${b.date}→${a.date}`);
+    if (b.kind !== a.kind) diffs.push(`분류 ${b.kind}→${a.kind}`);
+    if (b.card !== a.card) diffs.push(`카드 ${cardLabel(b.card)}→${cardLabel(a.card)}`);
+    if ((b.memo || '') !== (a.memo || '')) diffs.push('메모 변경');
+    return diffs.length ? diffs.join(', ') : '변경 없음';
+  }
+
+  async function loadAudit() {
+    if (!auditBody) return;
+    const { res, data } = await api('/api/audit-logs?limit=50');
+    if (!res.ok || !data) {
+      auditBody.innerHTML = '<tr><td colspan="4" class="empty">불러오기 실패</td></tr>';
+      return;
+    }
+    const logs = data.logs || [];
+    auditBody.innerHTML = '';
+    if (logs.length === 0) {
+      auditBody.innerHTML = '<tr><td colspan="4" class="empty">이력 없음</td></tr>';
+      return;
+    }
+    for (const log of logs) {
+      const tr = document.createElement('tr');
+      const atTd = document.createElement('td');
+      atTd.textContent = log.at;
+      const actTd = document.createElement('td');
+      const badge = document.createElement('span');
+      badge.className = log.action === 'delete' ? 'badge badge-danger' : 'badge badge-ok';
+      badge.textContent = log.action === 'delete' ? '삭제' : '수정';
+      actTd.appendChild(badge);
+      const tgtTd = document.createElement('td');
+      tgtTd.textContent = log.target;
+      const sumTd = document.createElement('td');
+      sumTd.textContent = summarize(log);
+      tr.appendChild(atTd);
+      tr.appendChild(actTd);
+      tr.appendChild(tgtTd);
+      tr.appendChild(sumTd);
+      auditBody.appendChild(tr);
+    }
+  }
+
+  // ---- 수정 모달 ----
+  const editDate = document.getElementById('txedit-date');
+  const editAmount = document.getElementById('txedit-amount');
+  const editCatField = document.getElementById('txedit-cat-field');
+  const editMemberField = document.getElementById('txedit-member-field');
+  const editCatSelect = document.getElementById('txedit-category');
+  const editMemberSelect = document.getElementById('txedit-member');
+  const editMemo = document.getElementById('txedit-memo');
+
+  function setEditKind(kind) {
+    state.editKind = kind;
+    for (const b of document.querySelectorAll('[data-txedit-kind]')) {
+      b.classList.toggle('active', b.dataset.txeditKind === kind);
+    }
+    if (editCatField) editCatField.hidden = kind !== 'common';
+    if (editMemberField) editMemberField.hidden = kind !== 'personal';
+  }
+  function setEditCard(card) {
+    state.editCard = card; // 1 | 2 | null
+    for (const b of document.querySelectorAll('[data-txedit-card]')) {
+      const v = b.dataset.txeditCard === '' ? null : Number(b.dataset.txeditCard);
+      b.classList.toggle('active', v === card);
+    }
+  }
+  for (const b of document.querySelectorAll('[data-txedit-kind]')) {
+    b.addEventListener('click', () => setEditKind(b.dataset.txeditKind));
+  }
+  for (const b of document.querySelectorAll('[data-txedit-card]')) {
+    b.addEventListener('click', () =>
+      setEditCard(b.dataset.txeditCard === '' ? null : Number(b.dataset.txeditCard)),
+    );
+  }
+
+  async function loadEditOptions() {
+    // 수정은 당월만 가능하므로 state.period(=당월)의 카테고리·active 팀원을 싣는다.
+    if (editCatSelect) {
+      const { res, data } = await api(`/api/periods/${state.period}/categories`);
+      if (res.ok && data) {
+        editCatSelect.innerHTML = '';
+        for (const c of data.categories || []) {
+          const opt = document.createElement('option');
+          opt.value = c.id;
+          opt.textContent = c.name;
+          editCatSelect.appendChild(opt);
+        }
+      }
+    }
+    if (editMemberSelect) {
+      const { res, data } = await api('/api/members?active=1');
+      if (res.ok && data) {
+        editMemberSelect.innerHTML = '';
+        for (const m of data.members || []) {
+          const opt = document.createElement('option');
+          opt.value = m.id;
+          opt.textContent = m.name;
+          editMemberSelect.appendChild(opt);
+        }
+      }
+    }
+  }
+
+  async function openEditModal(t) {
+    if (isPastSelected()) return; // 과거 월 잠금.
+    await loadEditOptions();
+    document.getElementById('txedit-id').value = t.id;
+    if (editDate) editDate.value = t.date;
+    if (editAmount) editAmount.value = t.amount;
+    if (editMemo) editMemo.value = t.memo || '';
+    setEditKind(t.kind);
+    setEditCard(t.card === 1 || t.card === 2 ? t.card : null);
+    if (t.kind === 'common' && editCatSelect && t.period_category_id != null) {
+      editCatSelect.value = String(t.period_category_id);
+    }
+    if (t.kind === 'personal' && editMemberSelect && t.member_id != null) {
+      editMemberSelect.value = String(t.member_id);
+    }
+    showMsg('txedit-modal-msg', '');
+    openModal('txedit-modal');
+  }
+
+  const editSaveBtn = document.getElementById('txedit-modal-save');
+  if (editSaveBtn) {
+    editSaveBtn.addEventListener('click', async () => {
+      const id = document.getElementById('txedit-id').value;
+      const date = editDate ? editDate.value : '';
+      const amount = Math.trunc(Number((editAmount ? editAmount.value : '').trim()));
+      if (!date) {
+        showMsg('txedit-modal-msg', '날짜를 선택하세요.');
+        return;
+      }
+      if (!Number.isInteger(amount) || amount <= 0) {
+        showMsg('txedit-modal-msg', '금액은 0보다 큰 정수여야 합니다.');
+        return;
+      }
+      const body = { date, amount, kind: state.editKind, card: state.editCard };
+      if (state.editKind === 'common') {
+        const cid = Number(editCatSelect ? editCatSelect.value : '');
+        if (!Number.isInteger(cid)) {
+          showMsg('txedit-modal-msg', '카테고리를 선택하세요.');
+          return;
+        }
+        body.period_category_id = cid;
+      } else {
+        const mid = Number(editMemberSelect ? editMemberSelect.value : '');
+        if (!Number.isInteger(mid)) {
+          showMsg('txedit-modal-msg', '대상 팀원을 선택하세요.');
+          return;
+        }
+        body.member_id = mid;
+      }
+      const memo = editMemo ? editMemo.value.trim() : '';
+      if (memo) body.memo = memo;
+
+      const { res, data } = await api(`/api/transactions/${id}`, {
+        method: 'PUT',
+        body: JSON.stringify(body),
+      });
+      if (res.ok) {
+        closeModal('txedit-modal');
+        await loadList();
+        await loadAudit();
+        if (window.__dashboard) window.__dashboard.refresh();
+      } else {
+        const err = data && data.error ? data.error : '';
+        let msg = '저장에 실패했습니다.';
+        if (err === 'past_period_locked') msg = '과거 월은 수정할 수 없습니다.';
+        else if (err === 'date_not_in_current_period') msg = '당월 날짜만 입력할 수 있습니다.';
+        else if (err === 'invalid amount') msg = '금액을 확인하세요(0보다 큰 정수).';
+        else if (err === 'category not found') msg = '카테고리를 확인하세요.';
+        else if (err === 'member not found') msg = '대상 팀원을 확인하세요.';
+        else if (err === 'not found') msg = '이미 삭제된 내역일 수 있습니다.';
+        showMsg('txedit-modal-msg', msg);
+      }
+    });
+  }
+
+  // ---- 삭제 ----
+  function deleteTx(t) {
+    if (isPastSelected()) return;
+    const label =
+      t.kind === 'common' ? t.category_name || '공용' : t.member_name || '개인';
+    const confirmFn = window.__confirm;
+    const run = async () => {
+      const { res, data } = await api(`/api/transactions/${t.id}`, { method: 'DELETE' });
+      if (res.ok) {
+        await loadList();
+        await loadAudit();
+        if (window.__dashboard) window.__dashboard.refresh();
+      } else if (res.status === 409) {
+        await loadList(); // 잠금 상태 반영.
+      }
+      void data;
+    };
+    if (typeof confirmFn === 'function') {
+      confirmFn(`${t.date} ${label} ${fmtWon(t.amount)} 지출을 삭제할까요?`, '삭제', run);
+    } else {
+      run();
+    }
+  }
+
+  // ---- 필터·새로고침 배선 ----
+  for (const el of [filterKind, filterMember, filterCard]) {
+    if (el) el.addEventListener('change', loadList);
+  }
+  const histRefresh = document.getElementById('hist-refresh-btn');
+  if (histRefresh) histRefresh.addEventListener('click', loadList);
+  const auditRefresh = document.getElementById('audit-refresh-btn');
+  if (auditRefresh) auditRefresh.addEventListener('click', loadAudit);
+
+  // ---- 진입점 ----
+  let lastPeriod = null;
+
+  async function render(period) {
+    if (!period) return;
+    lastPeriod = period;
+    state.period = period;
+    // 당월 판별용 current를 확보(잠금 판단).
+    if (!state.current) {
+      const { res, data } = await api('/api/periods');
+      if (res.ok && data) state.current = data.current;
+    }
+    if (!state.membersLoaded) await loadMembersForFilter();
+    await loadList();
+    await loadAudit();
+  }
+
+  function refresh() {
+    if (lastPeriod) render(lastPeriod);
+  }
+
+  window.__history = { render, refresh };
 })();

@@ -613,37 +613,28 @@ function isValidDate(str) {
   );
 }
 
-// POST /api/transactions — 지출 1건 기록.
-// body: { date, amount, kind, period_category_id?, member_id?, card?, memo? }
-app.post('/api/transactions', (req, res) => {
-  const { date, amount, kind, period_category_id, member_id, card, memo } = req.body || {};
+// 지출 body 공통 검증 + 정규화(POST 신규 / PUT 수정 단일 소스).
+// period는 date에서 파생하며 반드시 currentPeriod()만 허용(과거/미래 월 불변성 보호).
+// 성공 시 정규화된 값, 실패 시 { error }를 반환한다(에러 코드는 POST와 동일).
+function validateTransactionInput(body) {
+  const { date, amount, kind, period_category_id, member_id, card, memo } = body || {};
 
   // date: 유효한 YYYY-MM-DD → period 파생.
-  if (!isValidDate(date)) {
-    return res.status(400).json({ ok: false, error: 'invalid date' });
-  }
+  if (!isValidDate(date)) return { error: 'invalid date' };
   const period = date.slice(0, 7);
-  // 신규 지출은 당월만(과거/미래 월 불변성 보호).
-  if (period !== currentPeriod()) {
-    return res.status(400).json({ ok: false, error: 'date_not_in_current_period' });
-  }
+  // 당월만(과거/미래 월 불변성 보호).
+  if (period !== currentPeriod()) return { error: 'date_not_in_current_period' };
 
   // amount: 양의 정수(≤0·비정수 거부).
-  if (!Number.isInteger(amount) || amount <= 0) {
-    return res.status(400).json({ ok: false, error: 'invalid amount' });
-  }
+  if (!Number.isInteger(amount) || amount <= 0) return { error: 'invalid amount' };
 
   // kind: 'common' | 'personal'.
-  if (kind !== 'common' && kind !== 'personal') {
-    return res.status(400).json({ ok: false, error: 'invalid kind' });
-  }
+  if (kind !== 'common' && kind !== 'personal') return { error: 'invalid kind' };
 
   // card: 없거나(undefined/null) 1|2.
   let cardVal = null;
   if (card !== undefined && card !== null) {
-    if (card !== 1 && card !== 2) {
-      return res.status(400).json({ ok: false, error: 'invalid card' });
-    }
+    if (card !== 1 && card !== 2) return { error: 'invalid card' };
     cardVal = card;
   }
 
@@ -651,42 +642,45 @@ app.post('/api/transactions', (req, res) => {
   let memberId = null;
   if (kind === 'common') {
     // 공용: period_category_id 필수 + 그 period의 period_categories에 존재해야 함.
-    if (!Number.isInteger(period_category_id)) {
-      return res.status(400).json({ ok: false, error: 'period_category_id required' });
-    }
+    if (!Number.isInteger(period_category_id)) return { error: 'period_category_id required' };
     const cat = db
       .prepare('SELECT id FROM period_categories WHERE id = ? AND period = ?')
       .get(period_category_id, period);
-    if (!cat) {
-      return res.status(400).json({ ok: false, error: 'category not found' });
-    }
+    if (!cat) return { error: 'category not found' };
     pcId = period_category_id;
     // member_id는 무시(null).
   } else {
     // 개인: member_id 필수 + 존재하는 active 팀원.
-    if (!Number.isInteger(member_id)) {
-      return res.status(400).json({ ok: false, error: 'member_id required' });
-    }
+    if (!Number.isInteger(member_id)) return { error: 'member_id required' };
     const member = db
       .prepare('SELECT id FROM members WHERE id = ? AND active = 1')
       .get(member_id);
-    if (!member) {
-      return res.status(400).json({ ok: false, error: 'member not found' });
-    }
+    if (!member) return { error: 'member not found' };
     memberId = member_id;
     // period_category_id는 null.
   }
 
   const memoVal = typeof memo === 'string' && memo.trim() !== '' ? memo.trim() : null;
 
-  ensurePeriod(db, period);
+  return { date, period, amount, kind, pcId, memberId, cardVal, memoVal };
+}
+
+// POST /api/transactions — 지출 1건 기록.
+// body: { date, amount, kind, period_category_id?, member_id?, card?, memo? }
+app.post('/api/transactions', (req, res) => {
+  const v = validateTransactionInput(req.body);
+  if (v.error) {
+    return res.status(400).json({ ok: false, error: v.error });
+  }
+
+  ensurePeriod(db, v.period);
   const info = db
     .prepare(
       `INSERT INTO transactions
          (date, period, amount, kind, period_category_id, member_id, card, memo, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`,
     )
-    .run(date, period, amount, kind, pcId, memberId, cardVal, memoVal);
+    .run(v.date, v.period, v.amount, v.kind, v.pcId, v.memberId, v.cardVal, v.memoVal);
 
   const row = db.prepare('SELECT * FROM transactions WHERE id = ?').get(info.lastInsertRowid);
   return res.status(201).json({ ok: true, transaction: row });
@@ -742,6 +736,111 @@ app.get('/api/transactions', (req, res) => {
     .all(...params);
 
   return res.json({ period, transactions: rows });
+});
+
+// --- 지출 수정·삭제 + 감사로그 (FR-09·12, PRD 2.5·4.3) ----------------------
+// 과거 월(period !== currentPeriod())의 지출은 수정·삭제 금지(409) — 과거 월 집계 불변성.
+// 수정·삭제는 audit_logs에 자동 기록한다(action·target·before·after). 단일 공유 계정이라
+// "누가"는 미식별(기록하지 않음). 감사 기록과 실제 변경은 한 트랜잭션으로 원자적 처리한다.
+
+// PUT /api/transactions/:id — 지출 1건 수정.
+app.put('/api/transactions/:id', (req, res) => {
+  const id = Number(req.params.id);
+  const before = db.prepare('SELECT * FROM transactions WHERE id = ?').get(id);
+  if (!before) return res.status(404).json({ ok: false, error: 'not found' });
+
+  // 대상의 저장된 period가 당월이 아니면 잠금(과거/미래 월 불변성). 차단이 먼저 → 감사기록 없음.
+  if (before.period !== currentPeriod()) {
+    return res.status(409).json({ ok: false, error: 'past_period_locked' });
+  }
+
+  // POST와 동일 검증(당월 날짜·양의정수 amount·kind·공용/개인 필수·card 1|2).
+  const v = validateTransactionInput(req.body);
+  if (v.error) return res.status(400).json({ ok: false, error: v.error });
+
+  // 검증 통과분만 원자적으로 수정 + 감사로그(update) 기록.
+  const tx = db.transaction(() => {
+    db.prepare(
+      `UPDATE transactions
+          SET date = ?, period = ?, amount = ?, kind = ?,
+              period_category_id = ?, member_id = ?, card = ?, memo = ?
+        WHERE id = ?`,
+    ).run(v.date, v.period, v.amount, v.kind, v.pcId, v.memberId, v.cardVal, v.memoVal, id);
+    const after = db.prepare('SELECT * FROM transactions WHERE id = ?').get(id);
+    db.prepare(
+      `INSERT INTO audit_logs (at, action, target, before, after)
+       VALUES (datetime('now'), 'update', ?, ?, ?)`,
+    ).run(`transactions:${id}`, JSON.stringify(before), JSON.stringify(after));
+    return after;
+  });
+  const updated = tx();
+  return res.json({ ok: true, transaction: updated });
+});
+
+// DELETE /api/transactions/:id — 지출 1건 삭제.
+app.delete('/api/transactions/:id', (req, res) => {
+  const id = Number(req.params.id);
+  const before = db.prepare('SELECT * FROM transactions WHERE id = ?').get(id);
+  if (!before) return res.status(404).json({ ok: false, error: 'not found' });
+
+  if (before.period !== currentPeriod()) {
+    return res.status(409).json({ ok: false, error: 'past_period_locked' });
+  }
+
+  // 감사로그(delete, after=null) 기록 후 삭제 — 원자적.
+  const tx = db.transaction(() => {
+    db.prepare(
+      `INSERT INTO audit_logs (at, action, target, before, after)
+       VALUES (datetime('now'), 'delete', ?, ?, NULL)`,
+    ).run(`transactions:${id}`, JSON.stringify(before));
+    db.prepare('DELETE FROM transactions WHERE id = ?').run(id);
+  });
+  tx();
+  return res.json({ ok: true });
+});
+
+// GET /api/audit-logs?limit=&target= — 변경 이력 목록(FR-12), at 최신순.
+// before/after는 JSON 문자열을 파싱해 객체(또는 null)로 반환한다. limit 기본 50.
+app.get('/api/audit-logs', (req, res) => {
+  let limit = 50;
+  if (req.query.limit !== undefined) {
+    const l = Number(req.query.limit);
+    if (Number.isInteger(l) && l > 0 && l <= 500) limit = l;
+  }
+  const where = [];
+  const params = [];
+  if (req.query.target !== undefined) {
+    where.push('target = ?');
+    params.push(String(req.query.target));
+  }
+  const rows = db
+    .prepare(
+      `SELECT id, at, action, target, before, after
+         FROM audit_logs
+        ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+        ORDER BY at DESC, id DESC
+        LIMIT ?`,
+    )
+    .all(...params, limit);
+
+  const safeParse = (s) => {
+    if (s === null || s === undefined) return null;
+    try {
+      return JSON.parse(s);
+    } catch {
+      return s; // 파싱 불가 시 원문 문자열 그대로.
+    }
+  };
+  const logs = rows.map((r) => ({
+    id: r.id,
+    at: r.at,
+    action: r.action,
+    target: r.target,
+    before: safeParse(r.before),
+    after: safeParse(r.after),
+  }));
+
+  return res.json({ logs });
 });
 
 // --- 대시보드 집계 (FR-07·08·10, PRD 2.1·2.2) ------------------------------
