@@ -590,6 +590,160 @@ app.post('/api/allocation/preview', (req, res) => {
   });
 });
 
+// --- 지출 입력·목록 (FR-06·10, PRD 2.1·2.5·4.3) ---------------------------
+// 지출 2종: 공용(kind='common', 특정 period_category_id 풀 차감) /
+//           개인(kind='personal', 특정 member_id 할당 차감).
+// 날짜→기간 자동 귀속(period=date.slice(0,7)). 신규 지출은 당월만 허용해
+// 과거 월 스냅샷 불변성을 지킨다. 수정/삭제·audit_logs는 T8 범위(여기선 없음).
+
+// 'YYYY-MM-DD' 형식 + 실제 달력상 유효 날짜 검증(예: 2026-02-30 거부).
+function isValidDate(str) {
+  if (typeof str !== 'string') return false;
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(str);
+  if (!m) return false;
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  const d = Number(m[3]);
+  if (mo < 1 || mo > 12 || d < 1 || d > 31) return false;
+  const dt = new Date(Date.UTC(y, mo - 1, d));
+  return (
+    dt.getUTCFullYear() === y &&
+    dt.getUTCMonth() === mo - 1 &&
+    dt.getUTCDate() === d
+  );
+}
+
+// POST /api/transactions — 지출 1건 기록.
+// body: { date, amount, kind, period_category_id?, member_id?, card?, memo? }
+app.post('/api/transactions', (req, res) => {
+  const { date, amount, kind, period_category_id, member_id, card, memo } = req.body || {};
+
+  // date: 유효한 YYYY-MM-DD → period 파생.
+  if (!isValidDate(date)) {
+    return res.status(400).json({ ok: false, error: 'invalid date' });
+  }
+  const period = date.slice(0, 7);
+  // 신규 지출은 당월만(과거/미래 월 불변성 보호).
+  if (period !== currentPeriod()) {
+    return res.status(400).json({ ok: false, error: 'date_not_in_current_period' });
+  }
+
+  // amount: 양의 정수(≤0·비정수 거부).
+  if (!Number.isInteger(amount) || amount <= 0) {
+    return res.status(400).json({ ok: false, error: 'invalid amount' });
+  }
+
+  // kind: 'common' | 'personal'.
+  if (kind !== 'common' && kind !== 'personal') {
+    return res.status(400).json({ ok: false, error: 'invalid kind' });
+  }
+
+  // card: 없거나(undefined/null) 1|2.
+  let cardVal = null;
+  if (card !== undefined && card !== null) {
+    if (card !== 1 && card !== 2) {
+      return res.status(400).json({ ok: false, error: 'invalid card' });
+    }
+    cardVal = card;
+  }
+
+  let pcId = null;
+  let memberId = null;
+  if (kind === 'common') {
+    // 공용: period_category_id 필수 + 그 period의 period_categories에 존재해야 함.
+    if (!Number.isInteger(period_category_id)) {
+      return res.status(400).json({ ok: false, error: 'period_category_id required' });
+    }
+    const cat = db
+      .prepare('SELECT id FROM period_categories WHERE id = ? AND period = ?')
+      .get(period_category_id, period);
+    if (!cat) {
+      return res.status(400).json({ ok: false, error: 'category not found' });
+    }
+    pcId = period_category_id;
+    // member_id는 무시(null).
+  } else {
+    // 개인: member_id 필수 + 존재하는 active 팀원.
+    if (!Number.isInteger(member_id)) {
+      return res.status(400).json({ ok: false, error: 'member_id required' });
+    }
+    const member = db
+      .prepare('SELECT id FROM members WHERE id = ? AND active = 1')
+      .get(member_id);
+    if (!member) {
+      return res.status(400).json({ ok: false, error: 'member not found' });
+    }
+    memberId = member_id;
+    // period_category_id는 null.
+  }
+
+  const memoVal = typeof memo === 'string' && memo.trim() !== '' ? memo.trim() : null;
+
+  ensurePeriod(db, period);
+  const info = db
+    .prepare(
+      `INSERT INTO transactions
+         (date, period, amount, kind, period_category_id, member_id, card, memo, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`,
+    )
+    .run(date, period, amount, kind, pcId, memberId, cardVal, memoVal);
+
+  const row = db.prepare('SELECT * FROM transactions WHERE id = ?').get(info.lastInsertRowid);
+  return res.status(201).json({ ok: true, transaction: row });
+});
+
+// GET /api/transactions?period=&kind=&member_id=&card=
+// 해당 period(미지정 시 당월)의 지출 목록. 공용은 카테고리명·개인은 팀원명을 조인.
+// 최신순(date desc, id desc). 수정·삭제·전체 필터 UI는 T8.
+app.get('/api/transactions', (req, res) => {
+  const period = req.query.period !== undefined ? req.query.period : currentPeriod();
+  if (!isValidPeriod(period)) {
+    return res.status(400).json({ ok: false, error: 'invalid period format' });
+  }
+
+  const where = ['t.period = ?'];
+  const params = [period];
+
+  if (req.query.kind !== undefined) {
+    if (req.query.kind !== 'common' && req.query.kind !== 'personal') {
+      return res.status(400).json({ ok: false, error: 'invalid kind' });
+    }
+    where.push('t.kind = ?');
+    params.push(req.query.kind);
+  }
+  if (req.query.member_id !== undefined) {
+    const mid = Number(req.query.member_id);
+    if (!Number.isInteger(mid)) {
+      return res.status(400).json({ ok: false, error: 'invalid member_id' });
+    }
+    where.push('t.member_id = ?');
+    params.push(mid);
+  }
+  if (req.query.card !== undefined) {
+    const c = Number(req.query.card);
+    if (c !== 1 && c !== 2) {
+      return res.status(400).json({ ok: false, error: 'invalid card' });
+    }
+    where.push('t.card = ?');
+    params.push(c);
+  }
+
+  const rows = db
+    .prepare(
+      `SELECT t.id, t.date, t.period, t.amount, t.kind, t.period_category_id, t.member_id,
+              t.card, t.memo, t.created_at,
+              pc.name AS category_name, m.name AS member_name
+         FROM transactions t
+         LEFT JOIN period_categories pc ON pc.id = t.period_category_id
+         LEFT JOIN members m ON m.id = t.member_id
+        WHERE ${where.join(' AND ')}
+        ORDER BY t.date DESC, t.id DESC`,
+    )
+    .all(...params);
+
+  return res.json({ period, transactions: rows });
+});
+
 // 향후 보호 API(/api/*)는 이 아래에 추가한다.
 
 app.listen(PORT, () => {

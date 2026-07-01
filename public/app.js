@@ -841,3 +841,265 @@
   // 탭 모듈이 최초 진입 시 호출.
   window.__settings = { load };
 })();
+
+// --- 지출 입력·최근 목록 (T6, FR-06·10) ------------------------------------
+// 헤더의 "+ 지출 입력"으로 어느 탭에서나 접근 가능. 저장은 POST /api/transactions,
+// 최근 목록은 GET /api/transactions?period=. 날짜→기간 자동 귀속·당월만 서버가 강제.
+(function expenses() {
+  const addBtn = document.getElementById('expense-add-btn');
+  if (!addBtn) return;
+
+  const fmtWon = (n) =>
+    typeof n === 'number' ? n.toLocaleString('ko-KR') + '원' : '–';
+
+  const openModal = (id) => {
+    const el = document.getElementById(id);
+    if (el) el.hidden = false;
+  };
+  const closeModal = (id) => {
+    const el = document.getElementById(id);
+    if (el) el.hidden = true;
+  };
+  const showMsg = (id, text) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (text) {
+      el.textContent = text;
+      el.hidden = false;
+    } else {
+      el.textContent = '';
+      el.hidden = true;
+    }
+  };
+
+  async function api(path, opts) {
+    const res = await fetch(path, {
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      ...opts,
+    });
+    let data = null;
+    try {
+      data = await res.json();
+    } catch (_) {
+      data = null;
+    }
+    return { res, data };
+  }
+
+  // 지출 입력 상태(선택 분류·카드). period는 서버 당월을 기준으로 확인만 한다.
+  const state = { current: null, kind: 'common', card: null };
+
+  const dateInput = document.getElementById('expense-date');
+  const amountInput = document.getElementById('expense-amount');
+  const catField = document.getElementById('expense-cat-field');
+  const memberField = document.getElementById('expense-member-field');
+  const catSelect = document.getElementById('expense-category');
+  const memberSelect = document.getElementById('expense-member');
+  const memoInput = document.getElementById('expense-memo');
+
+  function todayStr() {
+    const now = new Date();
+    const y = now.getFullYear();
+    const m = String(now.getMonth() + 1).padStart(2, '0');
+    const d = String(now.getDate()).padStart(2, '0');
+    return `${y}-${m}-${d}`;
+  }
+
+  async function loadCurrent() {
+    try {
+      const { res, data } = await api('/api/periods');
+      if (res.ok && data) state.current = data.current;
+    } catch (_) {
+      /* noop */
+    }
+  }
+
+  async function loadCategories() {
+    if (!state.current || !catSelect) return;
+    const { res, data } = await api(`/api/periods/${state.current}/categories`);
+    if (res.ok && data) {
+      catSelect.innerHTML = '';
+      for (const c of data.categories || []) {
+        const opt = document.createElement('option');
+        opt.value = c.id;
+        opt.textContent = c.name;
+        catSelect.appendChild(opt);
+      }
+    }
+  }
+
+  async function loadMembers() {
+    if (!memberSelect) return;
+    const { res, data } = await api('/api/members?active=1');
+    if (res.ok && data) {
+      memberSelect.innerHTML = '';
+      for (const m of data.members || []) {
+        const opt = document.createElement('option');
+        opt.value = m.id;
+        opt.textContent = m.name;
+        memberSelect.appendChild(opt);
+      }
+    }
+  }
+
+  // 분류에 따라 카테고리/팀원 필드를 조건부 노출.
+  function setKind(kind) {
+    state.kind = kind;
+    for (const b of document.querySelectorAll('.tab-btn[data-kind]')) {
+      b.classList.toggle('active', b.dataset.kind === kind);
+    }
+    if (catField) catField.hidden = kind !== 'common';
+    if (memberField) memberField.hidden = kind !== 'personal';
+  }
+
+  function setCard(card) {
+    state.card = card; // 1 | 2 | null
+    for (const b of document.querySelectorAll('.tab-btn[data-card]')) {
+      const v = b.dataset.card === '' ? null : Number(b.dataset.card);
+      b.classList.toggle('active', v === card);
+    }
+  }
+
+  // 분류 토글.
+  for (const b of document.querySelectorAll('.tab-btn[data-kind]')) {
+    b.addEventListener('click', () => setKind(b.dataset.kind));
+  }
+  // 카드 토글.
+  for (const b of document.querySelectorAll('.tab-btn[data-card]')) {
+    b.addEventListener('click', () =>
+      setCard(b.dataset.card === '' ? null : Number(b.dataset.card)),
+    );
+  }
+  // 빠른 금액 버튼(누적).
+  for (const b of document.querySelectorAll('[data-quick]')) {
+    b.addEventListener('click', () => {
+      if (!amountInput) return;
+      const cur = Math.trunc(Number((amountInput.value || '').trim() || '0')) || 0;
+      const add = Number(b.dataset.quick);
+      amountInput.value = String((cur < 0 ? 0 : cur) + add);
+    });
+  }
+  const clearBtn = document.getElementById('expense-amount-clear');
+  if (clearBtn) {
+    clearBtn.addEventListener('click', () => {
+      if (amountInput) amountInput.value = '';
+    });
+  }
+
+  async function openExpenseModal() {
+    await loadCurrent();
+    await Promise.all([loadCategories(), loadMembers()]);
+    if (dateInput) dateInput.value = todayStr();
+    if (amountInput) amountInput.value = '';
+    if (memoInput) memoInput.value = '';
+    setKind('common');
+    setCard(null);
+    showMsg('expense-modal-msg', '');
+    openModal('expense-modal');
+  }
+
+  addBtn.addEventListener('click', openExpenseModal);
+
+  document.getElementById('expense-modal-save').addEventListener('click', async () => {
+    const date = dateInput ? dateInput.value : '';
+    const amount = Math.trunc(Number((amountInput ? amountInput.value : '').trim()));
+    if (!date) {
+      showMsg('expense-modal-msg', '날짜를 선택하세요.');
+      return;
+    }
+    if (!Number.isInteger(amount) || amount <= 0) {
+      showMsg('expense-modal-msg', '금액은 0보다 큰 정수여야 합니다.');
+      return;
+    }
+    const body = { date, amount, kind: state.kind, card: state.card };
+    if (state.kind === 'common') {
+      const cid = Number(catSelect ? catSelect.value : '');
+      if (!Number.isInteger(cid)) {
+        showMsg('expense-modal-msg', '카테고리를 선택하세요.');
+        return;
+      }
+      body.period_category_id = cid;
+    } else {
+      const mid = Number(memberSelect ? memberSelect.value : '');
+      if (!Number.isInteger(mid)) {
+        showMsg('expense-modal-msg', '대상 팀원을 선택하세요.');
+        return;
+      }
+      body.member_id = mid;
+    }
+    const memo = memoInput ? memoInput.value.trim() : '';
+    if (memo) body.memo = memo;
+
+    const { res, data } = await api('/api/transactions', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+    if (res.ok) {
+      closeModal('expense-modal');
+      await loadRecent();
+    } else {
+      const err = data && data.error ? data.error : '';
+      let msg = '저장에 실패했습니다.';
+      if (err === 'date_not_in_current_period') msg = '당월 날짜만 입력할 수 있습니다.';
+      else if (err === 'invalid amount') msg = '금액을 확인하세요(0보다 큰 정수).';
+      else if (err === 'category not found') msg = '카테고리를 확인하세요.';
+      else if (err === 'member not found') msg = '대상 팀원을 확인하세요.';
+      showMsg('expense-modal-msg', msg);
+    }
+  });
+
+  // --- 최근 지출 미니 목록 -------------------------------------------------
+  const recentBody = document.getElementById('recent-body');
+  const cardLabel = (c) => (c === 1 ? '카드 1' : c === 2 ? '카드 2' : '–');
+
+  async function loadRecent() {
+    await loadCurrent();
+    const lbl = document.getElementById('recent-period');
+    if (lbl) lbl.textContent = state.current || '–';
+    if (!recentBody || !state.current) return;
+    const { res, data } = await api(`/api/transactions?period=${state.current}`);
+    if (!res.ok || !data) return;
+    const rows = (data.transactions || []).slice(0, 8);
+    recentBody.innerHTML = '';
+    if (rows.length === 0) {
+      recentBody.innerHTML = '<tr><td colspan="5" class="empty">지출 없음</td></tr>';
+      return;
+    }
+    for (const t of rows) {
+      const tr = document.createElement('tr');
+
+      const dateTd = document.createElement('td');
+      dateTd.textContent = t.date;
+
+      const kindTd = document.createElement('td');
+      const badge = document.createElement('span');
+      badge.className = t.kind === 'common' ? 'badge badge-ok' : 'badge badge-warn';
+      badge.textContent = t.kind === 'common' ? '공용' : '개인';
+      kindTd.appendChild(badge);
+
+      const targetTd = document.createElement('td');
+      targetTd.textContent =
+        t.kind === 'common' ? t.category_name || '–' : t.member_name || '–';
+
+      const cardTd = document.createElement('td');
+      cardTd.textContent = cardLabel(t.card);
+
+      const amtTd = document.createElement('td');
+      amtTd.style.textAlign = 'right';
+      amtTd.style.fontVariantNumeric = 'tabular-nums';
+      amtTd.textContent = fmtWon(t.amount);
+
+      tr.appendChild(dateTd);
+      tr.appendChild(kindTd);
+      tr.appendChild(targetTd);
+      tr.appendChild(cardTd);
+      tr.appendChild(amtTd);
+      recentBody.appendChild(tr);
+    }
+  }
+
+  const refreshBtn = document.getElementById('recent-refresh-btn');
+  if (refreshBtn) refreshBtn.addEventListener('click', loadRecent);
+
+  loadRecent();
+})();
