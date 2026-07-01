@@ -10,5 +10,13 @@
 .claude/.project_root
 .claude/.messenger_enabled
 
+# Node / app
+node_modules/
+data/
+.env
+.env.*
+!.env.example
+npm-debug.log*
+
 # macOS
 .DS_Store

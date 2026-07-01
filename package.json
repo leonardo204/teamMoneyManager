@@ -1,0 +1,21 @@
+{
+  "name": "team-money-manager",
+  "version": "0.1.0",
+  "description": "팀 부서비 운영 관리 웹앱 — 부서비 기록·배분·조회 내부 웹앱",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "init-db": "node src/init-db.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.8.1",
+    "bcryptjs": "^2.4.3",
+    "cookie-parser": "^1.4.7",
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2"
+  }
+}
