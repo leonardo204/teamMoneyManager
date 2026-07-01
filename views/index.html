@@ -23,42 +23,287 @@
 
   <div class="wrap">
     <nav class="tabs" aria-label="주요 화면">
-      <button class="tab-btn active" type="button" disabled>대시보드</button>
-      <button class="tab-btn" type="button" disabled>설정</button>
-      <button class="tab-btn" type="button" disabled>내역</button>
+      <button class="tab-btn active" type="button" data-tab="dashboard">대시보드</button>
+      <button class="tab-btn" type="button" data-tab="settings">설정</button>
+      <button class="tab-btn" type="button" data-tab="history">내역</button>
     </nav>
 
-    <section class="panel" style="margin-top: 1.1rem;">
-      <h2>기간 선택 (T3)</h2>
-      <div style="display: flex; align-items: center; gap: 0.8rem; flex-wrap: wrap;">
-        <label class="section-label" for="period-select" style="margin: 0;">회계 월</label>
-        <select id="period-select" style="width: auto; min-width: 160px;" aria-label="회계 월 선택">
-          <option>불러오는 중…</option>
-        </select>
-        <span class="chip-muted chip" id="period-current-badge" hidden>당월</span>
-      </div>
-
-      <div id="period-summary" style="margin-top: 1rem;" hidden>
-        <div style="display: flex; gap: 0.6rem; flex-wrap: wrap; margin-bottom: 0.8rem;">
-          <span class="chip chip-muted">인원 <strong id="sum-members">–</strong></span>
-          <span class="chip chip-muted">인당 <strong id="sum-perperson">–</strong></span>
-          <span class="chip">총예산 <strong id="sum-total">–</strong></span>
+    <!-- ==================== 대시보드 탭 ==================== -->
+    <div id="tab-dashboard" class="tab-panel">
+      <section class="panel" style="margin-top: 1.1rem;">
+        <h2>기간 선택 (T3)</h2>
+        <div style="display: flex; align-items: center; gap: 0.8rem; flex-wrap: wrap;">
+          <label class="section-label" for="period-select" style="margin: 0;">회계 월</label>
+          <select id="period-select" style="width: auto; min-width: 160px;" aria-label="회계 월 선택">
+            <option>불러오는 중…</option>
+          </select>
+          <span class="chip-muted chip" id="period-current-badge" hidden>당월</span>
         </div>
-        <table class="data" aria-label="월 카테고리 스냅샷">
+
+        <div id="period-summary" style="margin-top: 1rem;" hidden>
+          <div style="display: flex; gap: 0.6rem; flex-wrap: wrap; margin-bottom: 0.8rem;">
+            <span class="chip chip-muted">인원 <strong id="sum-members">–</strong></span>
+            <span class="chip chip-muted">인당 <strong id="sum-perperson">–</strong></span>
+            <span class="chip">총예산 <strong id="sum-total">–</strong></span>
+          </div>
+          <table class="data" aria-label="월 카테고리 스냅샷">
+            <thead>
+              <tr><th>카테고리</th><th style="text-align: right;">배정액</th></tr>
+            </thead>
+            <tbody id="period-cat-body">
+              <tr><td colspan="2" class="empty">불러오는 중…</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p class="hint" style="margin-top: 0.9rem;">
+          월 최초 접근 시 그 시점의 카테고리 템플릿·인원이 스냅샷으로 시드됩니다.
+          대시보드 집계(T7)는 <strong>구현 예정</strong>입니다.
+        </p>
+      </section>
+    </div>
+
+    <!-- ==================== 설정 탭 ==================== -->
+    <div id="tab-settings" class="tab-panel" hidden>
+      <!-- (1) 팀원 관리 -->
+      <section class="panel" style="margin-top: 1.1rem;">
+        <div style="display: flex; align-items: center; justify-content: space-between; gap: 0.6rem;">
+          <h2 style="margin: 0;">팀원 관리</h2>
+          <button class="btn btn-primary" type="button" id="member-add-btn">팀원 추가</button>
+        </div>
+        <p class="hint" id="member-msg" style="margin: 0.6rem 0 0;" hidden></p>
+        <table class="data" aria-label="팀원 목록" style="margin-top: 0.8rem;">
           <thead>
-            <tr><th>카테고리</th><th style="text-align: right;">배정액</th></tr>
+            <tr>
+              <th>이름</th><th>생일</th><th>상태</th>
+              <th style="text-align: right;">액션</th>
+            </tr>
           </thead>
-          <tbody id="period-cat-body">
-            <tr><td colspan="2" class="empty">불러오는 중…</td></tr>
+          <tbody id="member-body">
+            <tr><td colspan="4" class="empty">불러오는 중…</td></tr>
           </tbody>
         </table>
-      </div>
+      </section>
 
-      <p class="hint" style="margin-top: 0.9rem;">
-        월 최초 접근 시 그 시점의 카테고리 템플릿·인원이 스냅샷으로 시드됩니다.
-        설정·팀원 편집(T4)과 대시보드 본체(T7)는 <strong>구현 예정</strong>입니다.
-      </p>
-    </section>
+      <!-- (2) 카테고리 설정 -->
+      <section class="panel" style="margin-top: 1.1rem;">
+        <h2>카테고리 설정</h2>
+
+        <!-- 인당 금액 -->
+        <div style="margin-bottom: 1.2rem;">
+          <div class="section-label">인당 금액 (per_person)</div>
+          <div style="display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap;">
+            <input class="input" type="text" inputmode="numeric" id="per-person-input"
+              style="width: auto; min-width: 160px;" aria-label="인당 금액" />
+            <button class="btn btn-primary" type="button" id="per-person-save">저장</button>
+            <span class="hint" id="per-person-msg"></span>
+          </div>
+        </div>
+
+        <!-- (a) 카테고리 템플릿 -->
+        <div style="margin-bottom: 1.2rem;">
+          <div style="display: flex; align-items: center; justify-content: space-between; gap: 0.6rem;">
+            <div class="section-label" style="margin: 0;">카테고리 템플릿 (미래 월 시드 기본값)</div>
+            <button class="btn" type="button" id="tmpl-add-btn">템플릿 추가</button>
+          </div>
+          <p class="hint" style="margin: 0.4rem 0 0.6rem;">
+            템플릿 편집은 <strong>미래 월</strong> 시드에만 반영됩니다. 기존/과거 월 스냅샷은 불변입니다.
+          </p>
+          <table class="data" aria-label="카테고리 템플릿">
+            <thead>
+              <tr>
+                <th>카테고리</th><th style="text-align: right;">기본 금액</th>
+                <th style="text-align: right;">액션</th>
+              </tr>
+            </thead>
+            <tbody id="tmpl-body">
+              <tr><td colspan="3" class="empty">불러오는 중…</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- (b) 당월 카테고리 스냅샷 금액 수정 -->
+        <div>
+          <div style="display: flex; align-items: center; justify-content: space-between; gap: 0.6rem;">
+            <div class="section-label" style="margin: 0;">
+              당월 카테고리 (<span id="setcat-period">–</span> 스냅샷)
+            </div>
+            <button class="btn" type="button" id="setcat-add-btn">당월 카테고리 추가</button>
+          </div>
+          <p class="hint" id="setcat-msg" style="margin: 0.4rem 0 0.6rem;">
+            당월 금액 조정은 그 월 스냅샷을 직접 수정합니다. 과거 월은 잠겨 있어 수정할 수 없습니다.
+          </p>
+          <table class="data" aria-label="당월 카테고리">
+            <thead>
+              <tr>
+                <th>카테고리</th><th style="text-align: right;">금액</th>
+                <th style="text-align: right;">액션</th>
+              </tr>
+            </thead>
+            <tbody id="setcat-body">
+              <tr><td colspan="3" class="empty">불러오는 중…</td></tr>
+            </tbody>
+          </table>
+          <div style="margin-top: 0.7rem; text-align: right;">
+            <button class="btn btn-primary" type="button" id="setcat-save">당월 금액 저장</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- (3) 개인 조정 -->
+      <section class="panel" style="margin-top: 1.1rem;">
+        <div style="display: flex; align-items: center; justify-content: space-between; gap: 0.6rem;">
+          <h2 style="margin: 0;">개인 조정 (<span id="adj-period">–</span>)</h2>
+          <button class="btn btn-primary" type="button" id="adj-add-btn">조정 추가</button>
+        </div>
+        <p class="hint" style="margin: 0.6rem 0 0;">
+          팀원별 ± 라인(생일축하금 등). 금액은 +/− 모두 허용되며 당월 기준으로 관리됩니다.
+        </p>
+        <table class="data" aria-label="개인 조정" style="margin-top: 0.8rem;">
+          <thead>
+            <tr>
+              <th>팀원</th><th>라벨</th><th style="text-align: right;">금액</th>
+              <th style="text-align: right;">액션</th>
+            </tr>
+          </thead>
+          <tbody id="adj-body">
+            <tr><td colspan="4" class="empty">불러오는 중…</td></tr>
+          </tbody>
+        </table>
+      </section>
+    </div>
+
+    <!-- ==================== 내역 탭 ==================== -->
+    <div id="tab-history" class="tab-panel" hidden>
+      <section class="panel" style="margin-top: 1.1rem;">
+        <h2>내역</h2>
+        <p class="hint">지출 내역·감사 로그(T8)는 <strong>구현 예정</strong>입니다.</p>
+      </section>
+    </div>
+  </div>
+
+  <!-- ==================== 모달: 팀원 추가/수정 ==================== -->
+  <div class="modal-overlay" id="member-modal" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="member-modal-title">
+      <div class="modal-head">
+        <span class="modal-title" id="member-modal-title">팀원 추가</span>
+        <button class="modal-close" type="button" data-close="member-modal" aria-label="닫기">×</button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="member-modal-id" />
+        <div style="margin-bottom: 0.9rem;">
+          <div class="section-label">이름</div>
+          <input class="input" type="text" id="member-modal-name" placeholder="팀원 이름" />
+        </div>
+        <div style="margin-bottom: 0.9rem;">
+          <div class="section-label">생일 (선택)</div>
+          <input class="input" type="text" id="member-modal-birthday" placeholder="YYYY-MM-DD" />
+        </div>
+        <p class="hint" id="member-modal-msg" hidden></p>
+        <div style="display: flex; justify-content: flex-end; gap: 0.6rem;">
+          <button class="btn" type="button" data-close="member-modal">취소</button>
+          <button class="btn btn-primary" type="button" id="member-modal-save">저장</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== 모달: 삭제/비활성 확인 (팀원) ==================== -->
+  <div class="modal-overlay" id="confirm-modal" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="confirm-modal-title">
+      <div class="modal-head">
+        <span class="modal-title" id="confirm-modal-title">확인</span>
+        <button class="modal-close" type="button" data-close="confirm-modal" aria-label="닫기">×</button>
+      </div>
+      <div class="modal-body">
+        <p id="confirm-modal-text" style="margin: 0 0 1rem;">정말 삭제하시겠습니까?</p>
+        <div style="display: flex; justify-content: flex-end; gap: 0.6rem;">
+          <button class="btn" type="button" data-close="confirm-modal">취소</button>
+          <button class="btn btn-danger" type="button" id="confirm-modal-ok">삭제</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== 모달: 템플릿 추가/수정 ==================== -->
+  <div class="modal-overlay" id="tmpl-modal" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="tmpl-modal-title">
+      <div class="modal-head">
+        <span class="modal-title" id="tmpl-modal-title">템플릿 추가</span>
+        <button class="modal-close" type="button" data-close="tmpl-modal" aria-label="닫기">×</button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="tmpl-modal-id" />
+        <div style="margin-bottom: 0.9rem;">
+          <div class="section-label">카테고리명</div>
+          <input class="input" type="text" id="tmpl-modal-name" placeholder="예: 커피" />
+        </div>
+        <div style="margin-bottom: 0.9rem;">
+          <div class="section-label">기본 금액</div>
+          <input class="input" type="text" inputmode="numeric" id="tmpl-modal-amount" placeholder="0" />
+        </div>
+        <p class="hint" id="tmpl-modal-msg" hidden></p>
+        <div style="display: flex; justify-content: flex-end; gap: 0.6rem;">
+          <button class="btn" type="button" data-close="tmpl-modal">취소</button>
+          <button class="btn btn-primary" type="button" id="tmpl-modal-save">저장</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== 모달: 당월 카테고리 추가 ==================== -->
+  <div class="modal-overlay" id="setcat-modal" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="setcat-modal-title">
+      <div class="modal-head">
+        <span class="modal-title" id="setcat-modal-title">당월 카테고리 추가</span>
+        <button class="modal-close" type="button" data-close="setcat-modal" aria-label="닫기">×</button>
+      </div>
+      <div class="modal-body">
+        <div style="margin-bottom: 0.9rem;">
+          <div class="section-label">카테고리명</div>
+          <input class="input" type="text" id="setcat-modal-name" placeholder="예: 다과" />
+        </div>
+        <div style="margin-bottom: 0.9rem;">
+          <div class="section-label">금액</div>
+          <input class="input" type="text" inputmode="numeric" id="setcat-modal-amount" placeholder="0" />
+        </div>
+        <p class="hint" id="setcat-modal-msg" hidden></p>
+        <div style="display: flex; justify-content: flex-end; gap: 0.6rem;">
+          <button class="btn" type="button" data-close="setcat-modal">취소</button>
+          <button class="btn btn-primary" type="button" id="setcat-modal-save">추가</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== 모달: 개인 조정 추가/수정 ==================== -->
+  <div class="modal-overlay" id="adj-modal" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="adj-modal-title">
+      <div class="modal-head">
+        <span class="modal-title" id="adj-modal-title">조정 추가</span>
+        <button class="modal-close" type="button" data-close="adj-modal" aria-label="닫기">×</button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="adj-modal-id" />
+        <div style="margin-bottom: 0.9rem;">
+          <div class="section-label">팀원</div>
+          <select id="adj-modal-member" aria-label="팀원 선택"></select>
+        </div>
+        <div style="margin-bottom: 0.9rem;">
+          <div class="section-label">라벨</div>
+          <input class="input" type="text" id="adj-modal-label" placeholder="예: 생일축하금" />
+        </div>
+        <div style="margin-bottom: 0.9rem;">
+          <div class="section-label">금액 (± 허용)</div>
+          <input class="input" type="text" inputmode="numeric" id="adj-modal-amount" placeholder="예: 50000 또는 -20000" />
+        </div>
+        <p class="hint" id="adj-modal-msg" hidden></p>
+        <div style="display: flex; justify-content: flex-end; gap: 0.6rem;">
+          <button class="btn" type="button" data-close="adj-modal">취소</button>
+          <button class="btn btn-primary" type="button" id="adj-modal-save">저장</button>
+        </div>
+      </div>
+    </div>
   </div>
 
   <footer>
