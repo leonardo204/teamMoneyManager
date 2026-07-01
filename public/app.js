@@ -832,6 +832,65 @@
     }
   });
 
+  // ======================= 비밀번호 변경 (FR-01) =======================
+  // PUT /api/password. 새 비번==확인 검증(인라인), 성공/실패 모두 인라인 메시지.
+  // alert/confirm/prompt 미사용. 서버 에러코드를 사용자 문구로 매핑.
+  const pwForm = document.getElementById('pw-form');
+  if (pwForm) {
+    const pwCurrent = document.getElementById('pw-current');
+    const pwNew = document.getElementById('pw-new');
+    const pwConfirm = document.getElementById('pw-confirm');
+    const pwOk = document.getElementById('pw-ok');
+
+    const setPwError = (text) => {
+      if (pwOk) pwOk.hidden = true;
+      showMsg('pw-msg', text);
+    };
+    const setPwSuccess = () => {
+      showMsg('pw-msg', '');
+      if (pwOk) pwOk.hidden = false;
+    };
+
+    const PW_ERROR_TEXT = {
+      invalid_current_password: '현재 비밀번호가 올바르지 않습니다.',
+      weak_password: '새 비밀번호는 최소 8자 이상이어야 합니다.',
+      same_password: '현재 비밀번호와 다른 값을 입력하세요.',
+    };
+
+    pwForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const current = pwCurrent.value;
+      const next = pwNew.value;
+      const confirmVal = pwConfirm.value;
+
+      if (!current) {
+        setPwError('현재 비밀번호를 입력하세요.');
+        return;
+      }
+      if (next.length < 8) {
+        setPwError('새 비밀번호는 최소 8자 이상이어야 합니다.');
+        return;
+      }
+      if (next !== confirmVal) {
+        setPwError('새 비밀번호와 확인이 일치하지 않습니다.');
+        return;
+      }
+
+      const { res, data } = await api('/api/password', {
+        method: 'PUT',
+        body: JSON.stringify({ current_password: current, new_password: next }),
+      });
+
+      if (res.ok) {
+        setPwSuccess();
+        pwForm.reset();
+      } else {
+        const code = data && data.error;
+        setPwError(PW_ERROR_TEXT[code] || '변경에 실패했습니다.');
+      }
+    });
+  }
+
   // --- 초기 로드 ----------------------------------------------------------
   async function load() {
     try {

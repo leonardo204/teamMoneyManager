@@ -45,10 +45,14 @@ export function initSchema(db) {
   db.pragma('foreign_keys = ON');
 
   db.exec(`
-    -- settings: 인당 금액 (per_person). 단일 행 운영.
+    -- settings: 인당 금액 (per_person) + 로그인 비밀번호 해시. 단일 행 운영.
+    -- password_hash: 로그인 검증에 쓰는 bcrypt 해시(런타임 변경 대상, 볼륨 영속).
+    --   최초 기동 시 ensurePasswordHash()가 env(APP_PASSWORD_HASH)로 1회 부트스트랩.
+    --   기존 DB에는 아래 마이그레이션(ensurePasswordColumn)이 컬럼을 멱등 추가한다.
     CREATE TABLE IF NOT EXISTS settings (
-      id          INTEGER PRIMARY KEY CHECK (id = 1),
-      per_person  INTEGER NOT NULL DEFAULT 180000
+      id             INTEGER PRIMARY KEY CHECK (id = 1),
+      per_person     INTEGER NOT NULL DEFAULT 180000,
+      password_hash  TEXT                          -- nullable: NULL이면 로그인 fail-closed
     );
 
     -- members: 월과 무관하게 유지되는 팀원 명단.
@@ -114,6 +118,39 @@ export function initSchema(db) {
       after   TEXT                           -- JSON
     );
   `);
+}
+
+/**
+ * 기존 DB 마이그레이션(멱등): settings.password_hash 컬럼이 없으면 추가한다.
+ * CREATE TABLE IF NOT EXISTS는 이미 존재하는 테이블에 컬럼을 더하지 않으므로,
+ * 과거 스키마(비밀번호 컬럼 없음)로 만든 DB를 안전하게 최신 스키마로 올린다.
+ * @param {Database.Database} db
+ */
+export function ensurePasswordColumn(db) {
+  const cols = db.prepare('PRAGMA table_info(settings)').all();
+  const hasColumn = cols.some((c) => c.name === 'password_hash');
+  if (!hasColumn) {
+    db.exec('ALTER TABLE settings ADD COLUMN password_hash TEXT');
+  }
+}
+
+/**
+ * 로그인 비밀번호 해시 부트스트랩(멱등, 기동 시 1회).
+ * settings.password_hash가 NULL일 때만 env(APP_PASSWORD_HASH)로 채운다.
+ * - 이미 값이 있으면 env로 절대 덮어쓰지 않는다(설정 화면 변경분 보존).
+ * - env도 없으면 NULL 유지 → 로그인은 fail-closed(server.js에서 401 + 경고).
+ * 소스 코드에 기본 해시를 baking하지 않는다(공개 repo 안전).
+ * @param {Database.Database} db
+ */
+export function ensurePasswordHash(db) {
+  const row = db.prepare('SELECT password_hash FROM settings WHERE id = 1').get();
+  if (!row) return; // seedDefaults 이후 항상 존재하지만 방어.
+  if (row.password_hash == null) {
+    const envHash = process.env.APP_PASSWORD_HASH;
+    if (envHash) {
+      db.prepare('UPDATE settings SET password_hash = ? WHERE id = 1').run(envHash);
+    }
+  }
 }
 
 /**
@@ -195,7 +232,9 @@ export function getDb() {
   ensureDataDir();
   _db = new Database(DB_PATH);
   initSchema(_db);
+  ensurePasswordColumn(_db); // 기존 DB 마이그레이션(멱등).
   seedDefaults(_db);
+  ensurePasswordHash(_db); // env로 최초 1회 부트스트랩(있을 때).
   return _db;
 }
 

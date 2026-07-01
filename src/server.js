@@ -40,17 +40,26 @@ app.get('/api/health', (_req, res) => {
   res.json({ ok: true });
 });
 
+// 현재 로그인 비밀번호 해시를 DB(settings.password_hash)에서 읽는다(단일 소스).
+// env(APP_PASSWORD_HASH)는 최초 부트스트랩(ensurePasswordHash)에서만 쓰이고,
+// 이후 검증·변경은 모두 DB 해시를 기준으로 한다(런타임 변경분 보존).
+function getPasswordHash() {
+  const row = db.prepare('SELECT password_hash FROM settings WHERE id = 1').get();
+  return row ? row.password_hash : null;
+}
+
 // 로그인: 공유 비밀번호(bcrypt 해시) 검증 후 세션 쿠키 발급.
 app.post('/api/login', async (req, res) => {
   const { password } = req.body || {};
-  const hash = process.env.APP_PASSWORD_HASH;
+  const hash = getPasswordHash();
 
   // fail-closed: 해시 미설정이면 항상 거부하고 명확히 경고한다.
   if (!hash) {
     // eslint-disable-next-line no-console
     console.warn(
-      '[auth] APP_PASSWORD_HASH is not set — 모든 로그인이 거부됩니다(fail-closed). ' +
-        "`npm run hash-pw '<비밀번호>'`로 해시를 생성해 .env에 설정하세요.",
+      '[auth] settings.password_hash is not set — 모든 로그인이 거부됩니다(fail-closed). ' +
+        "최초 기동 시 APP_PASSWORD_HASH(env)로 부트스트랩되며, `npm run hash-pw '<비밀번호>'`로 " +
+        '해시를 생성해 .env에 설정한 뒤 재기동하세요.',
     );
     return res.status(401).json({ ok: false, error: 'invalid password' });
   }
@@ -206,6 +215,63 @@ app.put('/api/settings', (req, res) => {
   }
   db.prepare('UPDATE settings SET per_person = ? WHERE id = 1').run(per_person);
   return res.json({ ok: true, per_person });
+});
+
+// --- 비밀번호 변경 (FR-01 확장) --------------------------------------------
+// PUT /api/password  body: { current_password, new_password }
+// requireAuth 뒤에서만 접근 가능(로그인된 세션). 현재 DB 해시로 current_password를
+// 검증하고, 통과 시 새 비밀번호를 bcrypt 해시해 settings.password_hash에 저장한다.
+// 민감정보(평문·해시)는 응답/로그/감사기록 어디에도 남기지 않는다.
+app.put('/api/password', async (req, res) => {
+  const { current_password, new_password } = req.body || {};
+
+  const dbHash = getPasswordHash();
+  // 현재 해시가 없으면(fail-closed 상태) 검증 불가 → 401.
+  if (!dbHash) {
+    return res.status(401).json({ ok: false, error: 'invalid_current_password' });
+  }
+
+  // 현재 비밀번호 검증.
+  let currentOk = false;
+  if (typeof current_password === 'string' && current_password.length > 0) {
+    try {
+      currentOk = await bcrypt.compare(current_password, dbHash);
+    } catch {
+      currentOk = false;
+    }
+  }
+  if (!currentOk) {
+    return res.status(401).json({ ok: false, error: 'invalid_current_password' });
+  }
+
+  // 새 비밀번호 정책: 문자열 + 최소 8자.
+  if (typeof new_password !== 'string' || new_password.length < 8) {
+    return res.status(400).json({ ok: false, error: 'weak_password' });
+  }
+
+  // 현재와 동일한 비밀번호로의 변경 방지.
+  let sameAsCurrent = false;
+  try {
+    sameAsCurrent = await bcrypt.compare(new_password, dbHash);
+  } catch {
+    sameAsCurrent = false;
+  }
+  if (sameAsCurrent) {
+    return res.status(400).json({ ok: false, error: 'same_password' });
+  }
+
+  const newHash = await bcrypt.hash(new_password, 10);
+  // 변경 + 감사기록을 원자적으로. before/after에 해시·평문 저장 금지(변경 사실만 기록).
+  const tx = db.transaction(() => {
+    db.prepare('UPDATE settings SET password_hash = ? WHERE id = 1').run(newHash);
+    db.prepare(
+      `INSERT INTO audit_logs (at, action, target, before, after)
+       VALUES (datetime('now'), 'update', 'settings:password', ?, ?)`,
+    ).run(JSON.stringify({ changed: true }), JSON.stringify({ changed: true }));
+  });
+  tx();
+
+  return res.json({ ok: true });
 });
 
 // --- 팀원 관리 (FR-03) ------------------------------------------------------

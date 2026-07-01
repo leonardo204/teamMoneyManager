@@ -305,6 +305,37 @@
           </tbody>
         </table>
       </section>
+
+      <!-- (4) 비밀번호 변경 (FR-01) -->
+      <section class="panel" style="margin-top: 1.1rem;">
+        <h2>비밀번호 변경</h2>
+        <p class="hint" style="margin: 0.6rem 0 0;">
+          공유 로그인 비밀번호를 변경합니다. 변경 후에는 새 비밀번호로만 로그인할 수 있으며,
+          변경분은 DB(볼륨)에 저장됩니다. 최소 8자 이상이어야 합니다.
+        </p>
+        <form id="pw-form" autocomplete="off" style="margin-top: 0.9rem; max-width: 360px;">
+          <div style="margin-bottom: 0.8rem;">
+            <label class="section-label" for="pw-current">현재 비밀번호</label>
+            <input class="input" type="password" id="pw-current"
+              autocomplete="current-password" aria-label="현재 비밀번호" />
+          </div>
+          <div style="margin-bottom: 0.8rem;">
+            <label class="section-label" for="pw-new">새 비밀번호</label>
+            <input class="input" type="password" id="pw-new"
+              autocomplete="new-password" aria-label="새 비밀번호" />
+          </div>
+          <div style="margin-bottom: 0.8rem;">
+            <label class="section-label" for="pw-confirm">새 비밀번호 확인</label>
+            <input class="input" type="password" id="pw-confirm"
+              autocomplete="new-password" aria-label="새 비밀번호 확인" />
+          </div>
+          <div style="display: flex; align-items: center; gap: 0.6rem;">
+            <button class="btn btn-primary" type="submit" id="pw-save">비밀번호 변경</button>
+            <span class="badge badge-ok" id="pw-ok" hidden>변경되었습니다</span>
+            <span class="hint" id="pw-msg" hidden></span>
+          </div>
+        </form>
+      </section>
     </div>
 
     <!-- ==================== 내역 탭 (FR-09·12) ==================== -->
