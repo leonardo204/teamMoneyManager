@@ -1,19 +1,19 @@
 # docker-compose.yml — teamMoneyManager
 # 단일 Linux VM에서 `docker compose up -d --build` 한 번으로 기동.
-# 호스트 노출 포트 49876 -> 컨테이너 내부 8080 (호스트 8080은 사용 중이라 쓰지 않음).
+# 노출 포트 49876 (private 포트, 로컬/컨테이너 동일. well-known 8080은 충돌 회피로 쓰지 않음).
 # 환경변수(APP_PASSWORD_HASH·JWT_SECRET)는 같은 디렉토리의 .env에서 자동 주입된다.
 services:
   app:
     build: .
     ports:
-      - "49876:8080"
+      - "49876:49876"
     env_file:
       # format: raw — 값을 그대로 전달(보간 안 함). bcrypt 해시의 '$'가 변수로
       # 오인·훼손되는 것을 막는다(compose 기본 보간은 $2a$10$... 을 망가뜨림).
       - path: .env                                 # APP_PASSWORD_HASH·JWT_SECRET (커밋 금지)
         format: raw
     environment:
-      - PORT=8080
+      - PORT=49876
       # NODE_ENV=production 이면 세션 쿠키에 secure 플래그가 켜진다.
       # secure 쿠키는 HTTPS에서만 브라우저가 전송하므로, Caddy 등 HTTPS 리버스 프록시
       # 뒤에 둘 때만 활성화한다. HTTP 직결(http://VM_IP:49876) 접속이면 주석 유지.
@@ -27,7 +27,7 @@ services:
         - "CMD"
         - "node"
         - "-e"
-        - "fetch('http://localhost:8080/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        - "fetch('http://localhost:49876/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
       interval: 15s
       timeout: 5s
       retries: 5

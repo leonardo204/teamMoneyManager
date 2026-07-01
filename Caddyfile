@@ -1,7 +1,7 @@
 # Caddyfile — teamMoneyManager (선택: 도메인 HTTPS)
 #
 # 도메인이 있을 때만 사용한다. Caddy가 Let's Encrypt로 인증서를 자동 발급/갱신하고
-# app 컨테이너(내부 8080)로 리버스 프록시한다.
+# app 컨테이너(포트 49876)로 리버스 프록시한다.
 #
 # 사용법:
 #   1) 아래 example.com 을 실제 도메인으로, 이메일을 관리자 주소로 바꾼다.
@@ -18,5 +18,5 @@
 
 # 실제 도메인으로 교체.
 example.com {
-	reverse_proxy app:8080
+	reverse_proxy app:49876
 }

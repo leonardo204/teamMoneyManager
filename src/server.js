@@ -1,7 +1,7 @@
 // src/server.js
 // Express 앱: 로그인 게이트(FR-01) + 정적 자산 서빙 + REST API.
 // 서버 시작 시 DB 파일이 없으면 getDb()가 디렉토리 생성·스키마 초기화·시드를 자동 수행.
-// PORT 환경변수(기본 8080)로 리슨.
+// PORT 환경변수(기본 49876 — private 포트)로 리슨. 로컬/컨테이너 모두 동일 포트 사용.
 //
 // 정적 서빙 주의: 보호 대상 앱 셸(index.html)은 views/에 두고 라우트로만 전송한다.
 // express.static(public, {index:false})는 css/js 등 공개 자산만 서빙(무인증 허용).
@@ -25,7 +25,7 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.resolve(__dirname, '..', 'public');
 const VIEWS_DIR = path.resolve(__dirname, '..', 'views');
-const PORT = Number(process.env.PORT) || 8080;
+const PORT = Number(process.env.PORT) || 49876;
 
 // DB 초기화(파일 없으면 스키마 자동 생성 + 시드).
 const db = getDb();
