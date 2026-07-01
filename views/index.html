@@ -11,13 +11,14 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
 
   <!-- design tokens (부록 B) -->
-  <link rel="stylesheet" href="design-tokens.css" />
+  <link rel="stylesheet" href="/design-tokens.css" />
 </head>
 <body>
   <header class="app-header">
     <span class="dot" id="conn-dot" title="서버 연결 상태"></span>
     <h1>팀 부서비 운영 관리</h1>
     <span class="sub">인당 18만 원 × 팀원 수 · 월 단위 운영 · <span id="conn-label">연결 확인 중…</span></span>
+    <button class="btn" type="button" id="logout-btn" style="margin-left: auto;">로그아웃</button>
   </header>
 
   <div class="wrap">
@@ -31,7 +32,8 @@
       <h2>스캐폴딩 (T1)</h2>
       <p class="muted">
         기본 셸과 디자인 토큰이 적용된 초기 골격입니다.
-        로그인, 설정, 예산 배분, 지출 입력, 대시보드, 내역 조회는
+        로그인 게이트(T2)가 적용되어 인증된 사용자만 이 화면을 볼 수 있습니다.
+        설정, 예산 배분, 지출 입력, 대시보드, 내역 조회는
         <strong>구현 예정</strong>입니다.
       </p>
       <p class="hint">
@@ -44,6 +46,22 @@
     팀 부서비 운영 관리 웹앱 · 내부용 · light-console-ui
   </footer>
 
-  <script src="app.js"></script>
+  <script src="/app.js"></script>
+  <script>
+    (function () {
+      var btn = document.getElementById('logout-btn');
+      if (!btn) return;
+      btn.addEventListener('click', async function () {
+        btn.disabled = true;
+        try {
+          await fetch('/api/logout', {
+            method: 'POST',
+            headers: { Accept: 'application/json' },
+          });
+        } catch (_) { /* noop */ }
+        window.location.href = '/login';
+      });
+    })();
+  </script>
 </body>
 </html>

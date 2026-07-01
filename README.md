@@ -58,6 +58,40 @@ docker compose up -d
 
 ---
 
+## 로그인 설정 (FR-01)
+
+단일 **공유 비밀번호**로 접근을 통제하는 게이트입니다. 성공 시 서명된 httpOnly 쿠키(JWT)가
+발급되고, 미인증 접근은 로그인 페이지(HTML)로 리다이렉트되거나 401(API)을 받습니다.
+
+**1) 비밀번호 해시 생성** — 평문 비밀번호는 어디에도 저장하지 않고, bcrypt 해시만 보관합니다.
+
+```bash
+npm run hash-pw '원하는비밀번호'
+# 예: $2a$10$....  ← 출력된 해시 한 줄을 복사
+```
+
+**2) `.env`에 설정** — 생성한 해시와 JWT 시크릿을 채웁니다.
+
+```bash
+cp .env.example .env
+# .env 편집:
+#   APP_PASSWORD_HASH=<위에서 출력된 해시>
+#   JWT_SECRET=<랜덤 시크릿, 예: node -e "console.log(require('crypto').randomBytes(48).toString('hex'))">
+```
+
+**3) 기동 후 로그인** — 서버를 띄우고 `/login`에서 비밀번호를 입력합니다.
+
+```bash
+npm start            # 또는 docker compose up -d
+# 브라우저: http://localhost:8080/login  (Docker는 :49876)
+```
+
+- `APP_PASSWORD_HASH` 미설정 시 로그인은 항상 실패(fail-closed)하며 서버 로그에 경고가 남습니다.
+- 세션 쿠키(`session`)는 httpOnly · sameSite=lax · 만료 30일. `NODE_ENV=production`에서만 `secure` 플래그가 켜집니다(HTTPS 리버스 프록시 뒤 권장).
+- 공개 경로(무인증): `GET /login`, `POST /api/login`, `POST /api/logout`, `GET /api/health`, 정적 자산(css/js). 그 외는 인증 필요.
+
+---
+
 ## 데이터 백업
 
 SQLite 파일 하나(`data/app.db`)가 전체 상태입니다.

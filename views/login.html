@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>로그인 · 팀 부서비 운영 관리</title>
+
+  <!-- Inter 폰트 (부록 A.1) -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+
+  <!-- design tokens (부록 B) -->
+  <link rel="stylesheet" href="/design-tokens.css" />
+
+  <style>
+    /* 로그인 전용 레이아웃: 중앙 정렬. 색은 토큰만 사용(하드코딩 hex 금지). */
+    .login-wrap {
+      min-height: 100vh;
+      display: flex; align-items: center; justify-content: center;
+      padding: 1.6rem;
+    }
+    .login-panel { width: min(380px, 100%); }
+    .login-panel h1 {
+      font-size: 1.15rem; font-weight: 650; margin: 0 0 0.3rem;
+    }
+    .login-panel .sub { color: var(--muted); font-size: 0.82rem; margin: 0 0 1.2rem; }
+    .login-panel label {
+      display: block; font-size: 0.74rem; text-transform: uppercase;
+      letter-spacing: 0.05em; color: var(--muted); font-weight: 600;
+      margin-bottom: 0.45rem;
+    }
+    .login-actions { margin-top: 1rem; }
+    .login-actions .btn-primary { width: 100%; }
+    #login-error { margin-top: 0.9rem; display: none; }
+  </style>
+</head>
+<body>
+  <div class="login-wrap">
+    <section class="panel login-panel">
+      <h1>팀 부서비 운영 관리</h1>
+      <p class="sub">공유 비밀번호로 로그인하세요.</p>
+
+      <form id="login-form" autocomplete="off">
+        <label for="password">비밀번호</label>
+        <input
+          class="input"
+          type="password"
+          id="password"
+          name="password"
+          autocomplete="current-password"
+          autofocus
+          required
+        />
+
+        <div class="login-actions">
+          <button class="btn-primary" type="submit" id="submit-btn">로그인</button>
+        </div>
+
+        <div id="login-error">
+          <span class="badge badge-danger">로그인 실패</span>
+          <span class="hint" id="login-error-msg">비밀번호가 올바르지 않습니다.</span>
+        </div>
+      </form>
+    </section>
+  </div>
+
+  <script>
+    (function () {
+      var form = document.getElementById('login-form');
+      var errBox = document.getElementById('login-error');
+      var errMsg = document.getElementById('login-error-msg');
+      var submitBtn = document.getElementById('submit-btn');
+      var pw = document.getElementById('password');
+
+      function showError(msg) {
+        errMsg.textContent = msg || '비밀번호가 올바르지 않습니다.';
+        errBox.style.display = 'block';
+      }
+      function hideError() {
+        errBox.style.display = 'none';
+      }
+
+      form.addEventListener('submit', async function (e) {
+        e.preventDefault();
+        hideError();
+        submitBtn.disabled = true;
+        try {
+          var res = await fetch('/api/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+            body: JSON.stringify({ password: pw.value }),
+          });
+          if (res.ok) {
+            window.location.href = '/';
+            return;
+          }
+          var data = null;
+          try { data = await res.json(); } catch (_) { /* noop */ }
+          showError(data && data.error ? '비밀번호가 올바르지 않습니다.' : undefined);
+        } catch (_) {
+          showError('요청 처리 중 오류가 발생했습니다.');
+        } finally {
+          submitBtn.disabled = false;
+          pw.value = '';
+          pw.focus();
+        }
+      });
+    })();
+  </script>
+</body>
+</html>
