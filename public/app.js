@@ -158,7 +158,7 @@
     typeof n === 'number' ? n.toLocaleString('ko-KR') + '원' : '–';
 
   // 애플리케이션 설정 상태.
-  const state = { current: null, members: [] };
+  const state = { current: null, members: [], adjustments: [] };
 
   // --- 모달 헬퍼(.modal-overlay[hidden] 가드) -----------------------------
   const openModal = (id) => {
@@ -222,6 +222,90 @@
     if (confirmOk) confirmOk.textContent = okLabel || '삭제';
     confirmCb = cb;
     openModal('confirm-modal');
+  }
+
+  // ======================= 개인 할당 미리보기 (FR-05) =======================
+  // 화면의 현재 초안값(인당·당월 카테고리 합·조정 합·활성 인원)을 모아 서버
+  // POST /api/allocation/preview 로 계산한다. 산식은 서버 단일 소스(클라 중복 금지).
+  let previewTimer = null;
+
+  const setText = (id, text) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = text;
+  };
+
+  const activeMemberCount = () => state.members.filter((m) => m.active).length;
+
+  // 화면의 당월 카테고리 금액 입력 합(저장 전 초안).
+  function draftCommonTotal() {
+    let sum = 0;
+    if (setcatBody) {
+      for (const inp of setcatBody.querySelectorAll('input[data-field="amount"]')) {
+        const v = Number((inp.value || '').trim() || '0');
+        if (Number.isFinite(v)) sum += Math.trunc(v);
+      }
+    }
+    return sum;
+  }
+
+  // 조정 합(± 포함). 저장된 당월 조정 라인 기준.
+  function draftAdjustmentsTotal() {
+    let sum = 0;
+    for (const a of state.adjustments) {
+      const v = Number(a.amount);
+      if (Number.isFinite(v)) sum += Math.trunc(v);
+    }
+    return sum;
+  }
+
+  function draftPerPerson() {
+    const el = document.getElementById('per-person-input');
+    const v = Number((el ? el.value : '').trim());
+    return Number.isInteger(v) && v >= 0 ? v : 0;
+  }
+
+  async function runPreview() {
+    if (state.current) setText('alloc-period', state.current);
+
+    const per_person = draftPerPerson();
+    const member_count = activeMemberCount();
+    const common_total = draftCommonTotal();
+    const adjustments_total = draftAdjustmentsTotal();
+
+    // 입력값 파생 표시(즉시). base·distributable·총예산은 서버 응답으로 확정.
+    setText('alloc-members', String(member_count));
+    setText('alloc-perperson', fmtWon(per_person));
+    setText('alloc-common', fmtWon(common_total));
+    setText('alloc-adj', (adjustments_total > 0 ? '+' : '') + fmtWon(adjustments_total));
+
+    try {
+      const { res, data } = await api('/api/allocation/preview', {
+        method: 'POST',
+        body: JSON.stringify({ per_person, member_count, common_total, adjustments_total }),
+      });
+      const warn = document.getElementById('alloc-warn');
+      if (res.ok && data) {
+        setText('alloc-total', fmtWon(data.total_budget));
+        setText('alloc-distributable', fmtWon(data.distributable));
+        setText(
+          'alloc-base',
+          member_count > 0 ? fmtWon(data.base_allocation) : '계산 불가 (인원 0)',
+        );
+        if (warn) warn.hidden = data.warning !== 'over_budget';
+      } else {
+        setText('alloc-total', '–');
+        setText('alloc-distributable', '–');
+        setText('alloc-base', '–');
+        if (warn) warn.hidden = true;
+      }
+    } catch (_) {
+      /* noop */
+    }
+  }
+
+  function schedulePreview() {
+    if (previewTimer) clearTimeout(previewTimer);
+    previewTimer = setTimeout(runPreview, 250);
   }
 
   // ======================= 팀원 관리 =======================
@@ -289,6 +373,7 @@
     if (res.ok && data) {
       state.members = data.members || [];
       renderMembers();
+      schedulePreview();
     }
   }
 
@@ -543,6 +628,7 @@
       renderCurrentCats();
       const lbl = document.getElementById('setcat-period');
       if (lbl) lbl.textContent = state.current;
+      schedulePreview();
     }
   }
 
@@ -675,9 +761,11 @@
     if (!state.current) return;
     const { res, data } = await api(`/api/adjustments?period=${state.current}`);
     if (res.ok && data) {
-      renderAdjustments(data.adjustments);
+      state.adjustments = data.adjustments || [];
+      renderAdjustments(state.adjustments);
       const lbl = document.getElementById('adj-period');
       if (lbl) lbl.textContent = state.current;
+      schedulePreview();
     }
   }
 
@@ -744,6 +832,11 @@
     await loadCurrentCategories();
     await loadAdjustments();
   }
+
+  // 미리보기 실시간 갱신 배선(디바운스 250ms). 입력은 버블링되므로 컨테이너 위임.
+  const perPersonInputEl = document.getElementById('per-person-input');
+  if (perPersonInputEl) perPersonInputEl.addEventListener('input', schedulePreview);
+  if (setcatBody) setcatBody.addEventListener('input', schedulePreview);
 
   // 탭 모듈이 최초 진입 시 호출.
   window.__settings = { load };

@@ -65,6 +65,27 @@
 
     <!-- ==================== 설정 탭 ==================== -->
     <div id="tab-settings" class="tab-panel" hidden>
+      <!-- (0) 개인 할당 미리보기 (FR-05) -->
+      <section class="panel" style="margin-top: 1.1rem;">
+        <div style="display: flex; align-items: center; justify-content: space-between; gap: 0.6rem;">
+          <h2 style="margin: 0;">개인 할당 미리보기 (<span id="alloc-period">–</span>)</h2>
+          <span class="badge badge-danger" id="alloc-warn" hidden>예산 초과</span>
+        </div>
+        <p class="hint" style="margin: 0.6rem 0 0;">
+          인당 금액·당월 카테고리·개인 조정·활성 인원의 <strong>현재 초안값</strong>으로
+          개인 기본 할당을 즉시 재계산합니다(저장 전 미리보기, 서버 산식 단일 소스).
+        </p>
+        <div style="display: flex; gap: 0.6rem; flex-wrap: wrap; margin-top: 0.9rem;">
+          <span class="chip chip-muted">활성 인원 <strong id="alloc-members" style="font-variant-numeric: tabular-nums;">–</strong></span>
+          <span class="chip chip-muted">인당 <strong id="alloc-perperson" style="font-variant-numeric: tabular-nums;">–</strong></span>
+          <span class="chip chip-muted">공용 합 <strong id="alloc-common" style="font-variant-numeric: tabular-nums;">–</strong></span>
+          <span class="chip chip-muted">조정 합 <strong id="alloc-adj" style="font-variant-numeric: tabular-nums;">–</strong></span>
+          <span class="chip">총예산 <strong id="alloc-total" style="font-variant-numeric: tabular-nums;">–</strong></span>
+          <span class="chip">나눌 잔액 <strong id="alloc-distributable" style="font-variant-numeric: tabular-nums;">–</strong></span>
+          <span class="chip">개인 기본 할당 <strong id="alloc-base" style="font-variant-numeric: tabular-nums;">–</strong></span>
+        </div>
+      </section>
+
       <!-- (1) 팀원 관리 -->
       <section class="panel" style="margin-top: 1.1rem;">
         <div style="display: flex; align-items: center; justify-content: space-between; gap: 0.6rem;">

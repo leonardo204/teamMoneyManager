@@ -13,6 +13,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getDb, DB_PATH, ensurePeriod } from './db.js';
 import { currentPeriod, isValidPeriod } from './period.js';
+import { computeAllocation } from './budget.js';
 import {
   SESSION_COOKIE,
   signSession,
@@ -492,6 +493,101 @@ app.delete('/api/adjustments/:id', (req, res) => {
   }
   db.prepare('DELETE FROM adjustments WHERE id = ?').run(id);
   return res.json({ ok: true });
+});
+
+// --- 예산 배정 계산 (FR-05, PRD 2.2·2.6) -----------------------------------
+// "배정(allocation)"은 인당·인원·공용·조정으로 결정되는 개인 할당이다(사용액 아님 — T6/T7 범위).
+// 계산은 순수 모듈 src/budget.js(computeAllocation) 단일 소스로만 수행한다.
+
+// GET /api/allocation?period=  (미지정 시 당월)
+// 해당 월의 persisted 데이터(period_meta·period_categories·adjustments·settings·active members)로
+// 전체 브레이크다운을 반환. 팀원별 상세(members)는 당월 기준 active 팀원으로 산출한다.
+// 과거 월은 member_count만 스냅샷이므로 팀원별 상세는 생략하고 aggregate는 정확히 반환한다.
+app.get('/api/allocation', (req, res) => {
+  const period = req.query.period !== undefined ? req.query.period : currentPeriod();
+  if (!isValidPeriod(period)) {
+    return res.status(400).json({ ok: false, error: 'invalid period format' });
+  }
+  ensurePeriod(db, period);
+
+  const meta = db
+    .prepare('SELECT member_count FROM period_meta WHERE period = ?')
+    .get(period);
+  const memberCount = meta ? meta.member_count : 0;
+  const perPerson = db.prepare('SELECT per_person FROM settings WHERE id = 1').get().per_person;
+  const commonTotal = db
+    .prepare('SELECT COALESCE(SUM(amount), 0) AS s FROM period_categories WHERE period = ?')
+    .get(period).s;
+
+  // 팀원별 상세는 당월만(과거 월은 active 명단이 스냅샷 인원과 다를 수 있어 aggregate만 신뢰).
+  // 불변식 보증: 당월 adjustments_total은 반드시 members(active)의 조정 합과 일치해야 한다.
+  // 비활성 팀원의 조정은 수령자가 없으므로 분배 대상에서 제외한다(돈이 새지 않도록, PRD 2.2).
+  let memberAdjustments = [];
+  let adjustmentsTotal;
+  if (period === currentPeriod()) {
+    memberAdjustments = db
+      .prepare(
+        `SELECT m.id AS member_id, m.name AS name,
+                COALESCE(
+                  (SELECT SUM(a.amount) FROM adjustments a
+                    WHERE a.member_id = m.id AND a.period = ?), 0
+                ) AS adjustment
+           FROM members m
+          WHERE m.active = 1
+          ORDER BY m.id`,
+      )
+      .all(period);
+    adjustmentsTotal = memberAdjustments.reduce((sum, m) => sum + m.adjustment, 0);
+  } else {
+    // 과거 월은 팀원별 상세를 산출하지 않으므로(스냅샷 인원만 신뢰) 전체 조정 합을 aggregate로 사용.
+    adjustmentsTotal = db
+      .prepare('SELECT COALESCE(SUM(amount), 0) AS s FROM adjustments WHERE period = ?')
+      .get(period).s;
+  }
+
+  const result = computeAllocation({
+    perPerson,
+    memberCount,
+    commonTotal,
+    adjustmentsTotal,
+    memberAdjustments,
+  });
+
+  return res.json({ period, per_person: perPerson, member_count: memberCount, ...result });
+});
+
+// POST /api/allocation/preview
+// body: { per_person, member_count, common_total, adjustments_total } (비영속 초안값)
+// 설정 화면 실시간 미리보기용. 동일 computeAllocation의 aggregate만 계산해 반환한다
+// (클라이언트 산식 중복 금지 — 단일 소스).
+app.post('/api/allocation/preview', (req, res) => {
+  const { per_person, member_count, common_total, adjustments_total } = req.body || {};
+
+  // 입력 방어: per_person·member_count·common_total은 0 이상 정수, adjustments_total은 ± 정수.
+  if (
+    !Number.isInteger(per_person) || per_person < 0 ||
+    !Number.isInteger(member_count) || member_count < 0 ||
+    !Number.isInteger(common_total) || common_total < 0 ||
+    !Number.isInteger(adjustments_total)
+  ) {
+    return res.status(400).json({ ok: false, error: 'invalid preview input' });
+  }
+
+  const result = computeAllocation({
+    perPerson: per_person,
+    memberCount: member_count,
+    commonTotal: common_total,
+    adjustmentsTotal: adjustments_total,
+    memberAdjustments: [],
+  });
+
+  return res.json({
+    total_budget: result.total_budget,
+    distributable: result.distributable,
+    base_allocation: result.base_allocation,
+    remainder: result.remainder,
+    warning: result.warning,
+  });
 });
 
 // 향후 보호 API(/api/*)는 이 아래에 추가한다.
