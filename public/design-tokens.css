@@ -60,6 +60,7 @@ body {
   display: flex; align-items: center; gap: 0.8rem;
   padding: 1.1rem 1.6rem; border-bottom: 1px solid var(--border);
   background: var(--panel);
+  position: sticky; top: 0; z-index: 40;
 }
 .app-header h1 { font-size: 1.15rem; font-weight: 650; margin: 0; }
 .app-header .sub { color: var(--muted); font-size: 0.82rem; }

@@ -57,7 +57,7 @@
     <!-- ==================== 대시보드 탭 ==================== -->
     <div id="tab-dashboard" class="tab-panel">
       <section class="panel" style="margin-top: 1.1rem;">
-        <h2>기간 선택 (T3)</h2>
+        <h2>기간 선택</h2>
         <div style="display: flex; align-items: center; gap: 0.8rem; flex-wrap: wrap;">
           <label class="section-label" for="period-select" style="margin: 0;">회계 월</label>
           <select id="period-select" style="width: auto; min-width: 160px;" aria-label="회계 월 선택">
@@ -66,25 +66,9 @@
           <span class="chip-muted chip" id="period-current-badge" hidden>당월</span>
         </div>
 
-        <div id="period-summary" style="margin-top: 1rem;" hidden>
-          <div style="display: flex; gap: 0.6rem; flex-wrap: wrap; margin-bottom: 0.8rem;">
-            <span class="chip chip-muted">인원 <strong id="sum-members">–</strong></span>
-            <span class="chip chip-muted">인당 <strong id="sum-perperson">–</strong></span>
-            <span class="chip">총예산 <strong id="sum-total">–</strong></span>
-          </div>
-          <table class="data" aria-label="월 카테고리 스냅샷">
-            <thead>
-              <tr><th>카테고리</th><th style="text-align: right;">배정액</th></tr>
-            </thead>
-            <tbody id="period-cat-body">
-              <tr><td colspan="2" class="empty">불러오는 중…</td></tr>
-            </tbody>
-          </table>
-        </div>
-
         <p class="hint" style="margin-top: 0.9rem;">
+          월을 선택하면 아래 대시보드·내역이 그 달 기준으로 갱신됩니다.
           월 최초 접근 시 그 시점의 카테고리 템플릿·인원이 스냅샷으로 시드됩니다.
-          선택한 월의 집계는 아래 대시보드에 표시됩니다.
         </p>
       </section>
 
@@ -143,16 +127,6 @@
         </table>
       </section>
 
-      <!-- ===== 카드별 사용 집계 (FR-10) ===== -->
-      <section class="panel" style="margin-top: 1.1rem;">
-        <h2>카드별 사용 (FR-10)</h2>
-        <div style="display: flex; gap: 0.6rem; flex-wrap: wrap;">
-          <span class="chip chip-muted">카드 1 <strong id="dash-card1" style="font-variant-numeric: tabular-nums;">–</strong></span>
-          <span class="chip chip-muted">카드 2 <strong id="dash-card2" style="font-variant-numeric: tabular-nums;">–</strong></span>
-          <span class="chip chip-muted">미지정 <strong id="dash-card-none" style="font-variant-numeric: tabular-nums;">–</strong></span>
-        </div>
-      </section>
-
       <!-- 최근 지출 미니 목록 (T6) — 전체 내역·필터·수정은 내역 탭(T8) -->
       <section class="panel" style="margin-top: 1.1rem;">
         <div style="display: flex; align-items: center; justify-content: space-between; gap: 0.6rem;">
@@ -165,12 +139,12 @@
         <table class="data" aria-label="최근 지출">
           <thead>
             <tr>
-              <th>날짜</th><th>분류</th><th>대상</th><th>카드</th>
+              <th>날짜</th><th>분류</th><th>대상</th>
               <th style="text-align: right;">금액</th>
             </tr>
           </thead>
           <tbody id="recent-body">
-            <tr><td colspan="5" class="empty">불러오는 중…</td></tr>
+            <tr><td colspan="4" class="empty">불러오는 중…</td></tr>
           </tbody>
         </table>
       </section>
@@ -178,7 +152,27 @@
 
     <!-- ==================== 설정 탭 ==================== -->
     <div id="tab-settings" class="tab-panel" hidden>
-      <!-- (0) 개인 할당 미리보기 (FR-05) -->
+      <!-- (1) 팀원 관리 -->
+      <section class="panel" style="margin-top: 1.1rem;">
+        <div style="display: flex; align-items: center; justify-content: space-between; gap: 0.6rem;">
+          <h2 style="margin: 0;">팀원 관리</h2>
+          <button class="btn btn-primary" type="button" id="member-add-btn">팀원 추가</button>
+        </div>
+        <p class="hint" id="member-msg" style="margin: 0.6rem 0 0;" hidden></p>
+        <table class="data" aria-label="팀원 목록" style="margin-top: 0.8rem;">
+          <thead>
+            <tr>
+              <th>이름</th><th>생일</th><th>상태</th>
+              <th style="text-align: right;">액션</th>
+            </tr>
+          </thead>
+          <tbody id="member-body">
+            <tr><td colspan="4" class="empty">불러오는 중…</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- (2) 개인 할당 미리보기 (FR-05) -->
       <section class="panel" style="margin-top: 1.1rem;">
         <div style="display: flex; align-items: center; justify-content: space-between; gap: 0.6rem;">
           <h2 style="margin: 0;">개인 할당 미리보기 (<span id="alloc-period">–</span>)</h2>
@@ -200,29 +194,13 @@
           <span class="chip">자투리 <strong id="alloc-surplus" style="font-variant-numeric: tabular-nums;">–</strong></span>
           <span class="chip">흡수 후 balancing 최종 <strong id="alloc-balancing-final" style="font-variant-numeric: tabular-nums;">–</strong></span>
         </div>
+        <!-- 계산식 공개: runPreview()가 draft/응답 값으로 채운다(실패 시 비움). -->
+        <div class="section-label" style="margin: 1rem 0 0.35rem;">계산식</div>
+        <div id="alloc-formula" class="hint"
+          style="white-space: pre-line; line-height: 1.6; font-variant-numeric: tabular-nums; overflow-wrap: anywhere;">–</div>
       </section>
 
-      <!-- (1) 팀원 관리 -->
-      <section class="panel" style="margin-top: 1.1rem;">
-        <div style="display: flex; align-items: center; justify-content: space-between; gap: 0.6rem;">
-          <h2 style="margin: 0;">팀원 관리</h2>
-          <button class="btn btn-primary" type="button" id="member-add-btn">팀원 추가</button>
-        </div>
-        <p class="hint" id="member-msg" style="margin: 0.6rem 0 0;" hidden></p>
-        <table class="data" aria-label="팀원 목록" style="margin-top: 0.8rem;">
-          <thead>
-            <tr>
-              <th>이름</th><th>생일</th><th>상태</th>
-              <th style="text-align: right;">액션</th>
-            </tr>
-          </thead>
-          <tbody id="member-body">
-            <tr><td colspan="4" class="empty">불러오는 중…</td></tr>
-          </tbody>
-        </table>
-      </section>
-
-      <!-- (2) 예산·카테고리 설정 -->
+      <!-- (3) 예산·카테고리 설정 -->
       <section class="panel" style="margin-top: 1.1rem;">
         <h2>예산·카테고리 설정</h2>
 
@@ -287,7 +265,7 @@
         </div>
       </section>
 
-      <!-- (3) 개인 조정 -->
+      <!-- (4) 개인 조정 -->
       <section class="panel" style="margin-top: 1.1rem;">
         <div style="display: flex; align-items: center; justify-content: space-between; gap: 0.6rem;">
           <h2 style="margin: 0;">개인 조정 (<span id="adj-period">–</span>)</h2>
@@ -309,7 +287,7 @@
         </table>
       </section>
 
-      <!-- (4) 비밀번호 변경 (FR-01) -->
+      <!-- (5) 비밀번호 변경 (FR-01) -->
       <section class="panel" style="margin-top: 1.1rem;">
         <h2>비밀번호 변경</h2>
         <p class="hint" style="margin: 0.6rem 0 0;">
@@ -353,7 +331,7 @@
           과거 월 내역은 잠겨 있어 수정·삭제할 수 없습니다(집계 불변성 보호).
         </p>
 
-        <!-- 필터 바 (분류/팀원/카드). 기간은 대시보드 탭의 기간 선택과 연동됩니다. -->
+        <!-- 필터 바 (분류/팀원). 기간은 대시보드 탭의 기간 선택과 연동됩니다. -->
         <div style="display: flex; gap: 0.6rem; flex-wrap: wrap; align-items: center; margin: 0.9rem 0 0.4rem;">
           <label class="section-label" style="margin: 0;">분류</label>
           <select id="hist-filter-kind" style="width: auto; min-width: 110px;" aria-label="분류 필터">
@@ -365,24 +343,18 @@
           <select id="hist-filter-member" style="width: auto; min-width: 130px;" aria-label="팀원 필터">
             <option value="">전체</option>
           </select>
-          <label class="section-label" style="margin: 0;">카드</label>
-          <select id="hist-filter-card" style="width: auto; min-width: 110px;" aria-label="카드 필터">
-            <option value="">전체</option>
-            <option value="1">카드 1</option>
-            <option value="2">카드 2</option>
-          </select>
         </div>
 
         <table class="data" aria-label="지출 내역" style="margin-top: 0.6rem;">
           <thead>
             <tr>
-              <th>날짜</th><th>분류</th><th>대상</th><th>카드</th>
+              <th>날짜</th><th>분류</th><th>대상</th>
               <th style="text-align: right;">금액</th><th>메모</th>
               <th style="text-align: right;">액션</th>
             </tr>
           </thead>
           <tbody id="hist-body">
-            <tr><td colspan="7" class="empty">불러오는 중…</td></tr>
+            <tr><td colspan="6" class="empty">불러오는 중…</td></tr>
           </tbody>
         </table>
       </section>
@@ -509,6 +481,36 @@
     </div>
   </div>
 
+  <!-- ==================== 모달: 예산 초과 — 카테고리 조정 ==================== -->
+  <div class="modal-overlay" id="overbudget-modal" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="overbudget-modal-title">
+      <div class="modal-head">
+        <span class="modal-title" id="overbudget-modal-title">예산 초과 — 카테고리 조정 필요</span>
+        <button class="modal-close" type="button" data-close="overbudget-modal" aria-label="닫기">×</button>
+      </div>
+      <div class="modal-body">
+        <p class="hint" id="ob-message" style="margin: 0 0 0.6rem;"></p>
+        <p id="ob-status" style="margin: 0 0 0.9rem; font-weight: 600; font-variant-numeric: tabular-nums;"></p>
+        <div class="section-label">카테고리</div>
+        <table class="data" aria-label="카테고리 조정" style="margin-top: 0.4rem;">
+          <thead>
+            <tr>
+              <th>카테고리</th><th style="text-align: right;">금액</th>
+              <th style="text-align: right;">적용</th>
+            </tr>
+          </thead>
+          <tbody id="ob-cat-list">
+            <tr><td colspan="3" class="empty">불러오는 중…</td></tr>
+          </tbody>
+        </table>
+        <div style="display: flex; justify-content: flex-end; gap: 0.6rem; margin-top: 1rem;">
+          <button class="btn" type="button" data-close="overbudget-modal">닫기</button>
+          <button class="btn btn-primary" type="button" id="ob-save" disabled>개인 예산 저장</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- ==================== 모달: 지출 입력 (T6, FR-06·10) ==================== -->
   <div class="modal-overlay" id="expense-modal" hidden>
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="expense-modal-title">
@@ -557,16 +559,6 @@
         <div style="margin-bottom: 0.9rem;" id="expense-member-field" hidden>
           <div class="section-label">대상 팀원 (개인 할당 차감)</div>
           <select id="expense-member" aria-label="대상 팀원 선택"></select>
-        </div>
-
-        <!-- 카드 선택 (1/2/없음, FR-10) -->
-        <div style="margin-bottom: 0.9rem;">
-          <div class="section-label">카드</div>
-          <div class="tabs" role="group" aria-label="사용 카드">
-            <button class="tab-btn" type="button" data-card="1">카드 1</button>
-            <button class="tab-btn" type="button" data-card="2">카드 2</button>
-            <button class="tab-btn active" type="button" data-card="">없음</button>
-          </div>
         </div>
 
         <!-- 메모 -->
@@ -627,16 +619,6 @@
         <div style="margin-bottom: 0.9rem;" id="txedit-member-field" hidden>
           <div class="section-label">대상 팀원 (개인 할당 차감)</div>
           <select id="txedit-member" aria-label="대상 팀원 선택"></select>
-        </div>
-
-        <!-- 카드 선택 -->
-        <div style="margin-bottom: 0.9rem;">
-          <div class="section-label">카드</div>
-          <div class="tabs" role="group" aria-label="사용 카드">
-            <button class="tab-btn" type="button" data-txedit-card="1">카드 1</button>
-            <button class="tab-btn" type="button" data-txedit-card="2">카드 2</button>
-            <button class="tab-btn active" type="button" data-txedit-card="">없음</button>
-          </div>
         </div>
 
         <!-- 메모 -->

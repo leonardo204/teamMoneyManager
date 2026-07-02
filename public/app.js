@@ -25,77 +25,20 @@
 // --- 기간(월) 선택 골격 ----------------------------------------------------
 (function periodPicker() {
   const select = document.getElementById('period-select');
-  const summary = document.getElementById('period-summary');
   const currentBadge = document.getElementById('period-current-badge');
-  const catBody = document.getElementById('period-cat-body');
-  const sumMembers = document.getElementById('sum-members');
-  const sumPerPerson = document.getElementById('sum-perperson');
-  const sumTotal = document.getElementById('sum-total');
   if (!select) return;
 
   // 애플리케이션 기간 상태(선택된 회계 월). 후속 태스크가 이 값을 참조한다.
   const state = { current: null, selected: null };
 
-  const fmtWon = (n) =>
-    typeof n === 'number' ? n.toLocaleString('ko-KR') + '원' : '–';
-
-  async function loadCategories(period) {
+  // 선택한 회계 월을 대시보드 본체(T7)·내역(T8)에 전파한다. 요약 칩·카테고리 스냅샷
+  // 테이블은 대시보드 본체(FR-07)와 중복이라 제거했고, 이 영역은 월 선택 컨트롤만 담당한다.
+  function loadCategories(period) {
     if (!period) return;
     state.selected = period;
     if (currentBadge) currentBadge.hidden = period !== state.current;
-    try {
-      const res = await fetch(`/api/periods/${period}/categories`, {
-        headers: { Accept: 'application/json' },
-      });
-      if (!res.ok) throw new Error(`categories ${res.status}`);
-      const data = await res.json();
-
-      if (sumMembers) sumMembers.textContent = String(data.member_count);
-      if (sumPerPerson) sumPerPerson.textContent = fmtWon(data.per_person);
-      if (sumTotal) sumTotal.textContent = fmtWon(data.total_budget);
-
-      if (catBody) {
-        catBody.innerHTML = '';
-        if (!data.categories || data.categories.length === 0) {
-          const tr = document.createElement('tr');
-          tr.innerHTML = '<td colspan="2" class="empty">카테고리 없음</td>';
-          catBody.appendChild(tr);
-        } else {
-          for (const c of data.categories) {
-            const tr = document.createElement('tr');
-            const nameTd = document.createElement('td');
-            nameTd.textContent = c.name;
-            const amtTd = document.createElement('td');
-            amtTd.style.textAlign = 'right';
-            amtTd.style.fontVariantNumeric = 'tabular-nums';
-            amtTd.textContent = fmtWon(c.amount);
-            tr.appendChild(nameTd);
-            tr.appendChild(amtTd);
-            catBody.appendChild(tr);
-          }
-        }
-      }
-      if (summary) summary.hidden = false;
-
-      // 대시보드 본체(T7)를 선택된 기간으로 갱신(탭 진입/기간 변경 시).
-      if (window.__dashboard) window.__dashboard.render(period);
-      // 내역 탭(T8)도 같은 선택 기간으로 동기화(기간 선택과 연동).
-      if (window.__history) window.__history.render(period);
-
-      // 스냅샷을 콘솔로도 확인 가능하게 남겨둔다.
-      // eslint-disable-next-line no-console
-      console.info('[period] snapshot', {
-        period: data.period,
-        member_count: data.member_count,
-        per_person: data.per_person,
-        total_budget: data.total_budget,
-        categories: data.categories,
-      });
-    } catch (err) {
-      // eslint-disable-next-line no-console
-      console.error('[period] load categories failed:', err);
-      if (summary) summary.hidden = true;
-    }
+    if (window.__dashboard) window.__dashboard.render(period);
+    if (window.__history) window.__history.render(period);
   }
 
   async function init() {
@@ -177,6 +120,9 @@
     adjustments: [],
     templates: [],
     balancing: null,
+    lastSurplus: 0,
+    // 서버 확정 allocation의 자투리(surplus). 카테고리 목록 표시는 이 값만 사용.
+    savedSurplus: 0,
   };
 
   // --- 모달 헬퍼(.modal-overlay[hidden] 가드) -----------------------------
@@ -294,6 +240,28 @@
     return t ? Math.trunc(Number(t.default_amount) || 0) : 0;
   }
 
+  // 부호 포함 금액(조정·자투리는 음수 가능). fmtWon은 음수 시 '-'를 붙인다.
+  const fmtSigned = (n) =>
+    (Number.isFinite(n) && n > 0 ? '+' : '') + fmtWon(n);
+
+  // 계산식 4줄을 draft/응답 값으로 채운다. p가 null이면 비운다(실패 분기).
+  function renderFormula(p) {
+    const el = document.getElementById('alloc-formula');
+    if (!el) return;
+    if (!p) {
+      el.textContent = '–';
+      return;
+    }
+    const balLabel = p.balName || 'balancing';
+    const lines = [
+      `총예산 = 인당 ${fmtWon(p.per_person)} × ${p.member_count}명 = ${fmtWon(p.total_budget)}`,
+      `개인예산 합 = 개인예산 ${fmtWon(p.per_member_budget)} × ${p.member_count}명 + 조정 ${fmtSigned(p.adjustments_total)} = ${fmtWon(p.personal_total)}`,
+      `자투리 = 총예산 ${fmtWon(p.total_budget)} − 카테고리 합 ${fmtWon(p.common_total)} − 개인예산 합 ${fmtWon(p.personal_total)} = ${fmtSigned(p.surplus)}`,
+      `${balLabel} 최종 = 설정액 ${fmtWon(p.balBase)} + 자투리 ${fmtSigned(p.surplus)} = ${fmtWon(p.balBase + p.surplus)}`,
+    ];
+    el.textContent = lines.join('\n');
+  }
+
   async function runPreview() {
     if (state.current) setText('alloc-period', state.current);
 
@@ -329,17 +297,32 @@
         // balancing 최종 = 선택된 흡수 항목의 설정 금액 + 자투리(surplus).
         const balSel = document.getElementById('balancing-select');
         const balName = balSel ? balSel.value : '';
+        const balBase = balName ? balancingBaseAmount(balName) : 0;
         setText(
           'alloc-balancing-final',
-          balName ? fmtWon(balancingBaseAmount(balName) + data.surplus) : '–',
+          balName ? fmtWon(balBase + data.surplus) : '–',
         );
         if (warn) warn.hidden = data.warning !== 'over_budget';
+        // 계산식 공개(draft/응답 값). 카테고리 목록의 확정 자투리와는 별개(저장 전 미리보기).
+        renderFormula({
+          per_person,
+          member_count,
+          per_member_budget,
+          common_total,
+          adjustments_total,
+          total_budget: data.total_budget,
+          personal_total: data.personal_total,
+          surplus: data.surplus,
+          balName,
+          balBase,
+        });
       } else {
         setText('alloc-total', '–');
         setText('alloc-personal', '–');
         setText('alloc-surplus', '–');
         setText('alloc-balancing-final', '–');
         if (warn) warn.hidden = true;
+        renderFormula(null);
       }
     } catch (_) {
       /* noop */
@@ -516,6 +499,21 @@
     }
   }
 
+  // 당월 확정 allocation을 조회해 카테고리 목록의 자투리 표시를 서버 단일 소스로 동기화.
+  // 설정 저장/카테고리 CRUD 성공 시마다 호출해 목록과 대시보드가 어긋나지 않게 한다.
+  async function loadAllocation() {
+    try {
+      const { res, data } = await api('/api/allocation'); // 당월
+      if (res.ok && data) {
+        state.savedSurplus = Number.isFinite(data.surplus) ? Math.trunc(data.surplus) : 0;
+        if (data.balancing_category) state.balancing = data.balancing_category;
+        renderTemplates(state.templates);
+      }
+    } catch (_) {
+      /* noop */
+    }
+  }
+
   document.getElementById('per-person-save').addEventListener('click', async () => {
     const raw = document.getElementById('per-person-input').value.trim();
     const val = Number(raw);
@@ -529,6 +527,7 @@
     });
     if (res.ok) {
       showMsg('per-person-msg', '저장됨');
+      await loadAllocation();
       schedulePreview();
     } else if (data && data.error === 'over_budget') {
       showMsg('per-person-msg', OVER_BUDGET_MSG);
@@ -550,9 +549,12 @@
     });
     if (res.ok) {
       showMsg('per-member-msg', '저장됨');
+      await loadAllocation();
       schedulePreview();
     } else if (data && data.error === 'over_budget') {
-      showMsg('per-member-msg', OVER_BUDGET_MSG);
+      // 자투리가 음수 → 카테고리를 바로 줄일 수 있는 모달로 안내.
+      showMsg('per-member-msg', '');
+      await openOverBudgetModal(val);
     } else {
       showMsg('per-member-msg', '저장 실패');
     }
@@ -572,6 +574,7 @@
     if (res.ok) {
       state.balancing = val;
       showMsg('balancing-msg', '저장됨');
+      await loadAllocation();
       schedulePreview();
     } else {
       showMsg('balancing-msg', '저장 실패');
@@ -597,7 +600,24 @@
       nameTd.textContent = t.name;
       const amtTd = document.createElement('td');
       amtTd.style.textAlign = 'right';
-      amtTd.textContent = fmtWon(t.default_amount);
+      if (t.name === state.balancing && state.savedSurplus !== 0) {
+        // 자투리 흡수 항목: 최종액(설정액 + 자투리)을 크게, 내역을 보조 텍스트로.
+        // 자투리는 서버 확정 allocation(savedSurplus)만 사용 — 대시보드와 항상 일치.
+        const base = Math.trunc(Number(t.default_amount) || 0);
+        const surplus = state.savedSurplus;
+        const strong = document.createElement('strong');
+        strong.style.fontVariantNumeric = 'tabular-nums';
+        strong.textContent = fmtWon(base + surplus);
+        const sub = document.createElement('div');
+        sub.className = 'hint';
+        sub.style.marginTop = '0.15rem';
+        const sign = surplus < 0 ? '−' : '+';
+        sub.textContent = `${fmtWon(base)} ${sign} 자투리 ${fmtWon(Math.abs(surplus))}`;
+        amtTd.appendChild(strong);
+        amtTd.appendChild(sub);
+      } else {
+        amtTd.textContent = fmtWon(t.default_amount);
+      }
       const actTd = document.createElement('td');
       actTd.style.textAlign = 'right';
       actTd.style.whiteSpace = 'nowrap';
@@ -646,6 +666,8 @@
       renderTemplates(state.templates);
       fillBalancingSelect();
       schedulePreview();
+      // 카테고리 CRUD 후 확정 자투리를 항상 재반영(목록·대시보드 정합).
+      await loadAllocation();
     }
   }
 
@@ -872,6 +894,180 @@
     });
   }
 
+  // ======================= 예산 초과 모달 (카테고리 축소) =======================
+  // 개인 예산 저장이 over_budget이면 카테고리를 즉시 줄여 자투리를 0 이상으로 만들 수
+  // 있게 안내한다. 리스너는 모듈 최초 로드 때 1회만 배선하고, 목록은 이벤트 위임으로 처리
+  // (모달을 여러 번 열어도 중복 바인딩 없음).
+  const obState = { perMember: 0, surplus: 0, saved: false };
+
+  // 저장하려는 개인 예산 기준으로 draft surplus를 서버에서 계산(클라 산식 중복 금지).
+  async function computeObSurplus() {
+    const { res, data } = await api('/api/allocation/preview', {
+      method: 'POST',
+      body: JSON.stringify({
+        per_person: draftPerPerson(),
+        member_count: activeMemberCount(),
+        common_total: draftCommonTotal(),
+        per_member_budget: obState.perMember,
+        adjustments_total: draftAdjustmentsTotal(),
+      }),
+    });
+    if (res.ok && data && Number.isFinite(data.surplus)) return Math.trunc(data.surplus);
+    return 0;
+  }
+
+  // 모달 내 카테고리 인라인 목록을 state.templates로 렌더(각 행: 이름·금액 input·적용).
+  function renderObCatList() {
+    const body = document.getElementById('ob-cat-list');
+    if (!body) return;
+    body.innerHTML = '';
+    if (!state.templates.length) {
+      body.innerHTML = '<tr><td colspan="3" class="empty">카테고리 없음</td></tr>';
+      return;
+    }
+    for (const t of state.templates) {
+      const tr = document.createElement('tr');
+
+      const nameTd = document.createElement('td');
+      nameTd.textContent = t.name;
+
+      const amtTd = document.createElement('td');
+      amtTd.style.textAlign = 'right';
+      const input = document.createElement('input');
+      input.className = 'input';
+      input.type = 'text';
+      input.inputMode = 'numeric';
+      input.value = String(Math.trunc(Number(t.default_amount) || 0));
+      input.style.width = '110px';
+      input.style.textAlign = 'right';
+      input.style.fontVariantNumeric = 'tabular-nums';
+      input.setAttribute('data-ob-input', String(t.id));
+      amtTd.appendChild(input);
+
+      const actTd = document.createElement('td');
+      actTd.style.textAlign = 'right';
+      const applyBtn = document.createElement('button');
+      applyBtn.className = 'btn';
+      applyBtn.type = 'button';
+      applyBtn.textContent = '적용';
+      applyBtn.setAttribute('data-ob-apply', String(t.id));
+      actTd.appendChild(applyBtn);
+      const rowMsg = document.createElement('div');
+      rowMsg.className = 'hint';
+      rowMsg.style.marginTop = '0.2rem';
+      rowMsg.setAttribute('data-ob-msg', String(t.id));
+      actTd.appendChild(rowMsg);
+
+      tr.appendChild(nameTd);
+      tr.appendChild(amtTd);
+      tr.appendChild(actTd);
+      body.appendChild(tr);
+    }
+  }
+
+  // 부족액/자투리/버튼 상태를 다시 계산해 반영.
+  async function refreshObStatus() {
+    obState.surplus = await computeObSurplus();
+    const shortage = Math.max(0, -obState.surplus);
+    const msgEl = document.getElementById('ob-message');
+    if (msgEl) {
+      msgEl.textContent =
+        `개인 예산을 ${fmtWon(obState.perMember)}으로 설정하려면 자투리가 ${fmtWon(shortage)} 부족합니다. ` +
+        '아래 카테고리를 줄여 자투리를 0 이상으로 만든 뒤 저장하세요.';
+    }
+    const statusEl = document.getElementById('ob-status');
+    if (statusEl) {
+      statusEl.textContent = `현재 자투리: ${(obState.surplus > 0 ? '+' : '') + fmtWon(obState.surplus)}`;
+      statusEl.style.color = obState.surplus < 0 ? 'var(--danger)' : 'var(--ok)';
+    }
+    const saveBtn = document.getElementById('ob-save');
+    if (saveBtn) saveBtn.disabled = obState.surplus < 0;
+  }
+
+  async function openOverBudgetModal(perMember) {
+    obState.perMember = perMember;
+    obState.saved = false; // 저장 없이 닫으면 입력값을 되돌리기 위한 플래그.
+    renderObCatList();
+    await refreshObStatus();
+    openModal('overbudget-modal');
+  }
+
+  // [적용] 이벤트 위임(목록 재생성돼도 유지).
+  const obCatListEl = document.getElementById('ob-cat-list');
+  if (obCatListEl) {
+    obCatListEl.addEventListener('click', async (e) => {
+      const btn = e.target.closest('[data-ob-apply]');
+      if (!btn) return;
+      const id = btn.getAttribute('data-ob-apply');
+      const input = obCatListEl.querySelector(`[data-ob-input="${id}"]`);
+      const rowMsg = obCatListEl.querySelector(`[data-ob-msg="${id}"]`);
+      const val = Number((input ? input.value : '').trim());
+      if (!Number.isInteger(val) || val < 0) {
+        if (rowMsg) rowMsg.textContent = '0 이상 정수를 입력하세요.';
+        return;
+      }
+      if (rowMsg) rowMsg.textContent = '';
+      const { res, data } = await api(`/api/category-templates/${id}`, {
+        method: 'PUT',
+        body: JSON.stringify({ default_amount: val }),
+      });
+      if (res.ok) {
+        await loadTemplates(); // state.templates·목록·확정 자투리 갱신
+        renderObCatList(); // 모달 목록 재생성(input 최신값)
+        await refreshObStatus(); // 부족액·자투리·버튼 상태 갱신
+      } else if (data && data.error === 'over_budget') {
+        if (rowMsg) rowMsg.textContent = '예산 초과로 적용할 수 없습니다.';
+      } else if (data && data.error === 'duplicate_name') {
+        if (rowMsg) rowMsg.textContent = '중복된 이름입니다.';
+      } else {
+        if (rowMsg) rowMsg.textContent = '적용에 실패했습니다.';
+      }
+    });
+  }
+
+  // [개인 예산 저장] — 자투리≥0일 때만 활성. 저장 성공 시 전체 갱신 후 모달 닫기.
+  const obSaveBtn = document.getElementById('ob-save');
+  if (obSaveBtn) {
+    obSaveBtn.addEventListener('click', async () => {
+      const { res, data } = await api('/api/settings', {
+        method: 'PUT',
+        body: JSON.stringify({ per_member_budget: obState.perMember }),
+      });
+      if (res.ok) {
+        obState.saved = true; // 저장됨 — 닫기 시 되돌리지 않음.
+        closeModal('overbudget-modal');
+        await loadSettings();
+        await loadTemplates(); // 내부에서 loadAllocation까지 수행
+        schedulePreview();
+        showMsg('per-member-msg', '저장됨');
+      } else if (data && data.error === 'over_budget') {
+        // 여전히 부족 — 상태줄만 갱신(모달 유지).
+        await refreshObStatus();
+      } else {
+        const statusEl = document.getElementById('ob-status');
+        if (statusEl) statusEl.textContent = '저장에 실패했습니다.';
+      }
+    });
+  }
+
+  // 모달을 '닫기/오버레이/×'로 닫으면(저장하지 않은 경우) 개인 예산 입력을 이전 저장값으로
+  // 되돌리고 안내한다. 미리보기·계산식이 draft 입력값을 반영하므로 초과값 잔존을 방지한다.
+  const obModalEl = document.getElementById('overbudget-modal');
+  if (obModalEl) {
+    const revertOnClose = async () => {
+      if (obState.saved) return; // 저장으로 닫힌 경우는 되돌리지 않음.
+      await loadSettings(); // per-member-input을 서버 저장값으로 복원.
+      schedulePreview();
+      showMsg('per-member-msg', '저장되지 않아 이전 값으로 되돌렸습니다.');
+    };
+    for (const btn of obModalEl.querySelectorAll('[data-close="overbudget-modal"]')) {
+      btn.addEventListener('click', revertOnClose);
+    }
+    obModalEl.addEventListener('click', (e) => {
+      if (e.target === obModalEl) revertOnClose();
+    });
+  }
+
   // --- 초기 로드 ----------------------------------------------------------
   async function load() {
     try {
@@ -883,6 +1079,8 @@
     await Promise.all([loadMembers(), loadSettings(), loadTemplates()]);
     fillAdjMemberSelect();
     await loadAdjustments();
+    // 카테고리 목록의 자투리 표시를 서버 확정값으로 동기화(최초 진입).
+    await loadAllocation();
     schedulePreview();
   }
 
@@ -942,8 +1140,8 @@
     return { res, data };
   }
 
-  // 지출 입력 상태(선택 분류·카드). period는 서버 당월을 기준으로 확인만 한다.
-  const state = { current: null, kind: 'common', card: null };
+  // 지출 입력 상태(선택 분류). period는 서버 당월을 기준으로 확인만 한다.
+  const state = { current: null, kind: 'common' };
 
   const dateInput = document.getElementById('expense-date');
   const amountInput = document.getElementById('expense-amount');
@@ -1008,23 +1206,9 @@
     if (memberField) memberField.hidden = kind !== 'personal';
   }
 
-  function setCard(card) {
-    state.card = card; // 1 | 2 | null
-    for (const b of document.querySelectorAll('.tab-btn[data-card]')) {
-      const v = b.dataset.card === '' ? null : Number(b.dataset.card);
-      b.classList.toggle('active', v === card);
-    }
-  }
-
   // 분류 토글.
   for (const b of document.querySelectorAll('.tab-btn[data-kind]')) {
     b.addEventListener('click', () => setKind(b.dataset.kind));
-  }
-  // 카드 토글.
-  for (const b of document.querySelectorAll('.tab-btn[data-card]')) {
-    b.addEventListener('click', () =>
-      setCard(b.dataset.card === '' ? null : Number(b.dataset.card)),
-    );
   }
   // 빠른 금액 버튼(누적).
   for (const b of document.querySelectorAll('[data-quick]')) {
@@ -1049,7 +1233,6 @@
     if (amountInput) amountInput.value = '';
     if (memoInput) memoInput.value = '';
     setKind('common');
-    setCard(null);
     showMsg('expense-modal-msg', '');
     openModal('expense-modal');
   }
@@ -1067,7 +1250,7 @@
       showMsg('expense-modal-msg', '금액은 0보다 큰 정수여야 합니다.');
       return;
     }
-    const body = { date, amount, kind: state.kind, card: state.card };
+    const body = { date, amount, kind: state.kind };
     if (state.kind === 'common') {
       const cid = Number(catSelect ? catSelect.value : '');
       if (!Number.isInteger(cid)) {
@@ -1106,7 +1289,6 @@
 
   // --- 최근 지출 미니 목록 -------------------------------------------------
   const recentBody = document.getElementById('recent-body');
-  const cardLabel = (c) => (c === 1 ? '카드 1' : c === 2 ? '카드 2' : '–');
 
   async function loadRecent() {
     await loadCurrent();
@@ -1118,7 +1300,7 @@
     const rows = (data.transactions || []).slice(0, 8);
     recentBody.innerHTML = '';
     if (rows.length === 0) {
-      recentBody.innerHTML = '<tr><td colspan="5" class="empty">지출 없음</td></tr>';
+      recentBody.innerHTML = '<tr><td colspan="4" class="empty">지출 없음</td></tr>';
       return;
     }
     for (const t of rows) {
@@ -1137,9 +1319,6 @@
       targetTd.textContent =
         t.kind === 'common' ? t.category_name || '–' : t.member_name || '–';
 
-      const cardTd = document.createElement('td');
-      cardTd.textContent = cardLabel(t.card);
-
       const amtTd = document.createElement('td');
       amtTd.style.textAlign = 'right';
       amtTd.style.fontVariantNumeric = 'tabular-nums';
@@ -1148,7 +1327,6 @@
       tr.appendChild(dateTd);
       tr.appendChild(kindTd);
       tr.appendChild(targetTd);
-      tr.appendChild(cardTd);
       tr.appendChild(amtTd);
       recentBody.appendChild(tr);
     }
@@ -1160,9 +1338,9 @@
   loadRecent();
 })();
 
-// --- 대시보드 본체 (T7, FR-07·08·10) ---------------------------------------
+// --- 대시보드 본체 (T7, FR-07·08) ------------------------------------------
 // 선택된 기간(period)으로 GET /api/dashboard 를 호출해 전체 소진율·카테고리 카드·
-// 팀원 테이블·카드 집계를 렌더한다. 산식/할당은 서버(computeAllocation) 단일 소스 —
+// 팀원 테이블을 렌더한다. 산식/할당은 서버(computeAllocation) 단일 소스 —
 // 클라이언트는 표시만 한다. 기간 선택(periodPicker)과 탭 전환(tabs)이 render/refresh를 호출한다.
 (function dashboard() {
   const fmtWon = (n) =>
@@ -1309,12 +1487,12 @@
     const members = d.members || [];
 
     if (members.length === 0) {
-      // 과거 월은 팀원별 스냅샷이 없어 상세 미제공(categories/totals/cards는 정확).
+      // 과거 월은 팀원별 스냅샷이 없어 상세 미제공(categories/totals는 정확).
       body.innerHTML =
         '<tr><td colspan="6" class="empty">당월에서만 팀원별 상세를 제공합니다.</td></tr>';
       if (hint) {
         hint.textContent =
-          '과거 월은 팀원 명단 스냅샷이 없어 팀원별 잔액을 표시하지 않습니다(전체·카테고리·카드 집계는 정확).';
+          '과거 월은 팀원 명단 스냅샷이 없어 팀원별 잔액을 표시하지 않습니다(전체·카테고리 집계는 정확).';
         hint.hidden = false;
       }
       return;
@@ -1366,14 +1544,6 @@
     }
   }
 
-  // ---- 카드별 사용 (FR-10) ----
-  function renderCards(d) {
-    const c = d.cards || {};
-    setText('dash-card1', fmtWon(c.card1 || 0));
-    setText('dash-card2', fmtWon(c.card2 || 0));
-    setText('dash-card-none', fmtWon(c.none || 0));
-  }
-
   // 마지막 렌더 기간(탭 재진입 refresh용).
   let lastPeriod = null;
 
@@ -1386,7 +1556,6 @@
       renderSummary(data);
       renderCategoryCards(data);
       renderMemberTable(data);
-      renderCards(data);
     } catch (err) {
       // eslint-disable-next-line no-console
       console.error('[dashboard] render failed:', err);
@@ -1401,7 +1570,7 @@
 })();
 
 // --- 내역 탭: 조회·수정·삭제 + 감사 로그 (T8, FR-09·12) ---------------------
-// 선택 기간(대시보드 기간 선택과 연동)의 전체 지출을 목록으로 보여주고, 분류/팀원/카드로
+// 선택 기간(대시보드 기간 선택과 연동)의 전체 지출을 목록으로 보여주고, 분류/팀원으로
 // 필터한다. 당월 지출만 수정(PUT)·삭제(DELETE) 가능 — 과거 월은 잠금(서버 409, UI 비활성).
 // 수정/삭제 시 서버가 audit_logs에 자동 기록하며, 하단 변경 이력에 최근 로그를 표시한다.
 // 확인은 커스텀 모달 window.__confirm 재사용(native confirm 금지).
@@ -1411,7 +1580,6 @@
 
   const fmtWon = (n) =>
     typeof n === 'number' ? n.toLocaleString('ko-KR') + '원' : '–';
-  const cardLabel = (c) => (c === 1 ? '카드 1' : c === 2 ? '카드 2' : '–');
 
   const openModal = (id) => {
     const el = document.getElementById(id);
@@ -1447,13 +1615,12 @@
     return { res, data };
   }
 
-  // 내역 상태: 선택 기간·당월·필터·편집 폼(분류/카드).
+  // 내역 상태: 선택 기간·당월·필터·편집 폼(분류).
   const state = {
     period: null,
     current: null,
     membersLoaded: false,
     editKind: 'common',
-    editCard: null,
   };
 
   const isPastSelected = () =>
@@ -1464,7 +1631,6 @@
   // ---- 필터 요소 ----
   const filterKind = document.getElementById('hist-filter-kind');
   const filterMember = document.getElementById('hist-filter-member');
-  const filterCard = document.getElementById('hist-filter-card');
 
   async function loadMembersForFilter() {
     // 필터·수정용 팀원 목록. 필터는 비활성 팀원(과거 지출 대상)도 포함해 전체를 싣는다.
@@ -1489,7 +1655,7 @@
   function renderList(rows) {
     histBody.innerHTML = '';
     if (!rows || rows.length === 0) {
-      histBody.innerHTML = '<tr><td colspan="7" class="empty">지출 없음</td></tr>';
+      histBody.innerHTML = '<tr><td colspan="6" class="empty">지출 없음</td></tr>';
       return;
     }
     const past = isPastSelected();
@@ -1508,9 +1674,6 @@
       const targetTd = document.createElement('td');
       targetTd.textContent =
         t.kind === 'common' ? t.category_name || '–' : t.member_name || '–';
-
-      const cardTd = document.createElement('td');
-      cardTd.textContent = cardLabel(t.card);
 
       const amtTd = document.createElement('td');
       amtTd.style.textAlign = 'right';
@@ -1545,7 +1708,6 @@
       tr.appendChild(dateTd);
       tr.appendChild(kindTd);
       tr.appendChild(targetTd);
-      tr.appendChild(cardTd);
       tr.appendChild(amtTd);
       tr.appendChild(memoTd);
       tr.appendChild(actTd);
@@ -1564,11 +1726,10 @@
     qs.set('period', state.period);
     if (filterKind && filterKind.value) qs.set('kind', filterKind.value);
     if (filterMember && filterMember.value) qs.set('member_id', filterMember.value);
-    if (filterCard && filterCard.value) qs.set('card', filterCard.value);
 
     const { res, data } = await api(`/api/transactions?${qs.toString()}`);
     if (!res.ok || !data) {
-      histBody.innerHTML = '<tr><td colspan="7" class="empty">불러오기 실패</td></tr>';
+      histBody.innerHTML = '<tr><td colspan="6" class="empty">불러오기 실패</td></tr>';
       return;
     }
     renderList(data.transactions || []);
@@ -1589,7 +1750,6 @@
     if (b.amount !== a.amount) diffs.push(`금액 ${fmtWon(b.amount)}→${fmtWon(a.amount)}`);
     if (b.date !== a.date) diffs.push(`날짜 ${b.date}→${a.date}`);
     if (b.kind !== a.kind) diffs.push(`분류 ${b.kind}→${a.kind}`);
-    if (b.card !== a.card) diffs.push(`카드 ${cardLabel(b.card)}→${cardLabel(a.card)}`);
     if ((b.memo || '') !== (a.memo || '')) diffs.push('메모 변경');
     return diffs.length ? diffs.join(', ') : '변경 없음';
   }
@@ -1645,20 +1805,8 @@
     if (editCatField) editCatField.hidden = kind !== 'common';
     if (editMemberField) editMemberField.hidden = kind !== 'personal';
   }
-  function setEditCard(card) {
-    state.editCard = card; // 1 | 2 | null
-    for (const b of document.querySelectorAll('[data-txedit-card]')) {
-      const v = b.dataset.txeditCard === '' ? null : Number(b.dataset.txeditCard);
-      b.classList.toggle('active', v === card);
-    }
-  }
   for (const b of document.querySelectorAll('[data-txedit-kind]')) {
     b.addEventListener('click', () => setEditKind(b.dataset.txeditKind));
-  }
-  for (const b of document.querySelectorAll('[data-txedit-card]')) {
-    b.addEventListener('click', () =>
-      setEditCard(b.dataset.txeditCard === '' ? null : Number(b.dataset.txeditCard)),
-    );
   }
 
   async function loadEditOptions() {
@@ -1697,7 +1845,6 @@
     if (editAmount) editAmount.value = t.amount;
     if (editMemo) editMemo.value = t.memo || '';
     setEditKind(t.kind);
-    setEditCard(t.card === 1 || t.card === 2 ? t.card : null);
     if (t.kind === 'common' && editCatSelect && t.period_category_id != null) {
       editCatSelect.value = String(t.period_category_id);
     }
@@ -1722,7 +1869,7 @@
         showMsg('txedit-modal-msg', '금액은 0보다 큰 정수여야 합니다.');
         return;
       }
-      const body = { date, amount, kind: state.editKind, card: state.editCard };
+      const body = { date, amount, kind: state.editKind };
       if (state.editKind === 'common') {
         const cid = Number(editCatSelect ? editCatSelect.value : '');
         if (!Number.isInteger(cid)) {
@@ -1789,7 +1936,7 @@
   }
 
   // ---- 필터·새로고침 배선 ----
-  for (const el of [filterKind, filterMember, filterCard]) {
+  for (const el of [filterKind, filterMember]) {
     if (el) el.addEventListener('change', loadList);
   }
   const histRefresh = document.getElementById('hist-refresh-btn');
