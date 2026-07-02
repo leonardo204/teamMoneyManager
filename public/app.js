@@ -171,7 +171,13 @@
     typeof n === 'number' ? n.toLocaleString('ko-KR') + '원' : '–';
 
   // 애플리케이션 설정 상태.
-  const state = { current: null, members: [], adjustments: [] };
+  const state = {
+    current: null,
+    members: [],
+    adjustments: [],
+    templates: [],
+    balancing: null,
+  };
 
   // --- 모달 헬퍼(.modal-overlay[hidden] 가드) -----------------------------
   const openModal = (id) => {
@@ -249,14 +255,12 @@
 
   const activeMemberCount = () => state.members.filter((m) => m.active).length;
 
-  // 화면의 당월 카테고리 금액 입력 합(저장 전 초안).
+  // 카테고리 합(저장된 템플릿 = 당월 스냅샷과 동기화됨) 초안.
   function draftCommonTotal() {
     let sum = 0;
-    if (setcatBody) {
-      for (const inp of setcatBody.querySelectorAll('input[data-field="amount"]')) {
-        const v = Number((inp.value || '').trim() || '0');
-        if (Number.isFinite(v)) sum += Math.trunc(v);
-      }
+    for (const t of state.templates) {
+      const v = Number(t.default_amount);
+      if (Number.isFinite(v)) sum += Math.trunc(v);
     }
     return sum;
   }
@@ -277,38 +281,64 @@
     return Number.isInteger(v) && v >= 0 ? v : 0;
   }
 
+  function draftPerMemberBudget() {
+    const el = document.getElementById('per-member-input');
+    const v = Number((el ? el.value : '').trim());
+    return Number.isInteger(v) && v >= 0 ? v : 0;
+  }
+
+  // balancing 카테고리의 "설정 금액"(surplus 가산 전) — 미리보기 흡수 후 최종액 계산용.
+  function balancingBaseAmount(name) {
+    if (!name) return 0;
+    const t = state.templates.find((x) => x.name === name);
+    return t ? Math.trunc(Number(t.default_amount) || 0) : 0;
+  }
+
   async function runPreview() {
     if (state.current) setText('alloc-period', state.current);
 
     const per_person = draftPerPerson();
+    const per_member_budget = draftPerMemberBudget();
     const member_count = activeMemberCount();
     const common_total = draftCommonTotal();
     const adjustments_total = draftAdjustmentsTotal();
 
-    // 입력값 파생 표시(즉시). base·distributable·총예산은 서버 응답으로 확정.
+    // 입력값 파생 표시(즉시). 총예산·개인예산합·자투리는 서버 응답으로 확정.
     setText('alloc-members', String(member_count));
     setText('alloc-perperson', fmtWon(per_person));
+    setText('alloc-permember', fmtWon(per_member_budget));
     setText('alloc-common', fmtWon(common_total));
     setText('alloc-adj', (adjustments_total > 0 ? '+' : '') + fmtWon(adjustments_total));
 
     try {
       const { res, data } = await api('/api/allocation/preview', {
         method: 'POST',
-        body: JSON.stringify({ per_person, member_count, common_total, adjustments_total }),
+        body: JSON.stringify({
+          per_person,
+          member_count,
+          common_total,
+          per_member_budget,
+          adjustments_total,
+        }),
       });
       const warn = document.getElementById('alloc-warn');
       if (res.ok && data) {
         setText('alloc-total', fmtWon(data.total_budget));
-        setText('alloc-distributable', fmtWon(data.distributable));
+        setText('alloc-personal', fmtWon(data.personal_total));
+        setText('alloc-surplus', (data.surplus < 0 ? '' : '') + fmtWon(data.surplus));
+        // balancing 최종 = 선택된 흡수 항목의 설정 금액 + 자투리(surplus).
+        const balSel = document.getElementById('balancing-select');
+        const balName = balSel ? balSel.value : '';
         setText(
-          'alloc-base',
-          member_count > 0 ? fmtWon(data.base_allocation) : '계산 불가 (인원 0)',
+          'alloc-balancing-final',
+          balName ? fmtWon(balancingBaseAmount(balName) + data.surplus) : '–',
         );
         if (warn) warn.hidden = data.warning !== 'over_budget';
       } else {
         setText('alloc-total', '–');
-        setText('alloc-distributable', '–');
-        setText('alloc-base', '–');
+        setText('alloc-personal', '–');
+        setText('alloc-surplus', '–');
+        setText('alloc-balancing-final', '–');
         if (warn) warn.hidden = true;
       }
     } catch (_) {
@@ -450,19 +480,42 @@
     });
   }
 
-  // 팀원 변동 시 인원 의존 표시(당월 요약·조정 팀원 목록) 갱신.
+  // 팀원 변동 시 인원 의존 표시(미리보기·조정 팀원 목록) 갱신.
   async function syncMemberDependents() {
-    await loadCurrentCategories();
     fillAdjMemberSelect();
+    schedulePreview();
   }
 
-  // ======================= 인당 금액 (per_person) =======================
-  async function loadPerPerson() {
+  // ======================= 예산 설정 (per_person / per_member_budget / balancing) =======================
+  const OVER_BUDGET_MSG = '예산 초과: 개인예산 합 + 카테고리 합이 총예산을 넘습니다.';
+
+  // balancing 흡수 항목 드롭다운을 현재 카테고리 목록으로 채운다(선택값 보존).
+  function fillBalancingSelect() {
+    const sel = document.getElementById('balancing-select');
+    if (!sel) return;
+    const desired = state.balancing;
+    sel.innerHTML = '';
+    for (const t of state.templates) {
+      const opt = document.createElement('option');
+      opt.value = t.name;
+      opt.textContent = t.name;
+      sel.appendChild(opt);
+    }
+    if (desired && state.templates.some((t) => t.name === desired)) {
+      sel.value = desired;
+    }
+  }
+
+  async function loadSettings() {
     const { res, data } = await api('/api/settings');
     if (res.ok && data) {
       document.getElementById('per-person-input').value = data.per_person;
+      document.getElementById('per-member-input').value = data.per_member_budget;
+      state.balancing = data.balancing_category;
+      fillBalancingSelect();
     }
   }
+
   document.getElementById('per-person-save').addEventListener('click', async () => {
     const raw = document.getElementById('per-person-input').value.trim();
     const val = Number(raw);
@@ -470,17 +523,63 @@
       showMsg('per-person-msg', '양의 정수를 입력하세요.');
       return;
     }
-    const { res } = await api('/api/settings', {
+    const { res, data } = await api('/api/settings', {
       method: 'PUT',
       body: JSON.stringify({ per_person: val }),
     });
     if (res.ok) {
       showMsg('per-person-msg', '저장됨');
-      await loadCurrentCategories();
+      schedulePreview();
+    } else if (data && data.error === 'over_budget') {
+      showMsg('per-person-msg', OVER_BUDGET_MSG);
     } else {
       showMsg('per-person-msg', '저장 실패');
     }
   });
+
+  document.getElementById('per-member-save').addEventListener('click', async () => {
+    const raw = document.getElementById('per-member-input').value.trim();
+    const val = Number(raw);
+    if (!Number.isInteger(val) || val < 0) {
+      showMsg('per-member-msg', '0 이상의 정수를 입력하세요.');
+      return;
+    }
+    const { res, data } = await api('/api/settings', {
+      method: 'PUT',
+      body: JSON.stringify({ per_member_budget: val }),
+    });
+    if (res.ok) {
+      showMsg('per-member-msg', '저장됨');
+      schedulePreview();
+    } else if (data && data.error === 'over_budget') {
+      showMsg('per-member-msg', OVER_BUDGET_MSG);
+    } else {
+      showMsg('per-member-msg', '저장 실패');
+    }
+  });
+
+  document.getElementById('balancing-save').addEventListener('click', async () => {
+    const sel = document.getElementById('balancing-select');
+    const val = sel ? sel.value : '';
+    if (!val) {
+      showMsg('balancing-msg', '카테고리를 선택하세요.');
+      return;
+    }
+    const { res } = await api('/api/settings', {
+      method: 'PUT',
+      body: JSON.stringify({ balancing_category: val }),
+    });
+    if (res.ok) {
+      state.balancing = val;
+      showMsg('balancing-msg', '저장됨');
+      schedulePreview();
+    } else {
+      showMsg('balancing-msg', '저장 실패');
+    }
+  });
+
+  const balancingSelEl = document.getElementById('balancing-select');
+  if (balancingSelEl) balancingSelEl.addEventListener('change', schedulePreview);
 
   // ======================= 카테고리 템플릿 =======================
   const tmplBody = document.getElementById('tmpl-body');
@@ -515,9 +614,19 @@
       delBtn.textContent = '삭제';
       delBtn.style.marginLeft = '0.3rem';
       delBtn.addEventListener('click', () =>
-        askConfirm(`템플릿 '${t.name}'을 삭제할까요?`, '삭제', async () => {
-          const { res } = await api(`/api/category-templates/${t.id}`, { method: 'DELETE' });
-          if (res.ok) await loadTemplates();
+        askConfirm(`카테고리 '${t.name}'을 삭제할까요?`, '삭제', async () => {
+          const { res, data } = await api(`/api/category-templates/${t.id}`, { method: 'DELETE' });
+          if (res.status === 409 && data && data.error === 'has_transactions') {
+            showMsg('tmpl-msg', '지출 내역이 있어 삭제할 수 없습니다.');
+            return;
+          }
+          if (res.ok) {
+            showMsg('tmpl-msg', '');
+            await loadTemplates();
+            await loadSettings(); // balancing 카테고리가 재지정됐을 수 있어 갱신.
+          } else {
+            showMsg('tmpl-msg', '삭제에 실패했습니다.');
+          }
         }),
       );
 
@@ -532,7 +641,12 @@
 
   async function loadTemplates() {
     const { res, data } = await api('/api/category-templates');
-    if (res.ok && data) renderTemplates(data.templates);
+    if (res.ok && data) {
+      state.templates = data.templates || [];
+      renderTemplates(state.templates);
+      fillBalancingSelect();
+      schedulePreview();
+    }
   }
 
   function openTmplModal(t) {
@@ -557,152 +671,19 @@
       return;
     }
     const body = { name, default_amount: amount };
-    const { res } = id
+    const { res, data } = id
       ? await api(`/api/category-templates/${id}`, { method: 'PUT', body: JSON.stringify(body) })
       : await api('/api/category-templates', { method: 'POST', body: JSON.stringify(body) });
     if (res.ok) {
       closeModal('tmpl-modal');
       await loadTemplates();
+      await loadSettings(); // balancing 이름 추종 반영.
+    } else if (data && data.error === 'duplicate_name') {
+      showMsg('tmpl-modal-msg', '이미 같은 이름의 카테고리가 있습니다.');
+    } else if (data && data.error === 'over_budget') {
+      showMsg('tmpl-modal-msg', '예산 초과: 카테고리 금액 합이 총예산을 넘습니다.');
     } else {
       showMsg('tmpl-modal-msg', '저장에 실패했습니다.');
-    }
-  });
-
-  // ======================= 당월 카테고리 스냅샷 =======================
-  const setcatBody = document.getElementById('setcat-body');
-  let currentCats = [];
-
-  function renderCurrentCats() {
-    if (!setcatBody) return;
-    setcatBody.innerHTML = '';
-    if (!currentCats || currentCats.length === 0) {
-      setcatBody.innerHTML = '<tr><td colspan="3" class="empty">카테고리 없음</td></tr>';
-      return;
-    }
-    for (const c of currentCats) {
-      const tr = document.createElement('tr');
-      const nameTd = document.createElement('td');
-      const nameInput = document.createElement('input');
-      nameInput.className = 'input';
-      nameInput.type = 'text';
-      nameInput.value = c.name;
-      nameInput.dataset.catId = c.id;
-      nameInput.dataset.field = 'name';
-      nameTd.appendChild(nameInput);
-
-      const amtTd = document.createElement('td');
-      amtTd.style.textAlign = 'right';
-      const amtInput = document.createElement('input');
-      amtInput.className = 'input';
-      amtInput.type = 'text';
-      amtInput.inputMode = 'numeric';
-      amtInput.value = c.amount;
-      amtInput.dataset.catId = c.id;
-      amtInput.dataset.field = 'amount';
-      amtInput.style.textAlign = 'right';
-      amtTd.appendChild(amtInput);
-
-      const actTd = document.createElement('td');
-      actTd.style.textAlign = 'right';
-      const delBtn = document.createElement('button');
-      delBtn.className = 'btn btn-danger';
-      delBtn.type = 'button';
-      delBtn.textContent = '삭제';
-      delBtn.addEventListener('click', () =>
-        askConfirm(`당월 카테고리 '${c.name}'을 삭제할까요?`, '삭제', async () => {
-          const { res, data } = await api(
-            `/api/periods/${state.current}/categories/${c.id}`,
-            { method: 'DELETE' },
-          );
-          if (res.status === 409 && data && data.error === 'has_transactions') {
-            showMsg('setcat-msg', '지출 내역이 있어 삭제 불가합니다.');
-            return;
-          }
-          if (res.ok) {
-            showMsg('setcat-msg', '');
-            await loadCurrentCategories();
-          }
-        }),
-      );
-      actTd.appendChild(delBtn);
-
-      tr.appendChild(nameTd);
-      tr.appendChild(amtTd);
-      tr.appendChild(actTd);
-      setcatBody.appendChild(tr);
-    }
-  }
-
-  async function loadCurrentCategories() {
-    if (!state.current) return;
-    const { res, data } = await api(`/api/periods/${state.current}/categories`);
-    if (res.ok && data) {
-      currentCats = data.categories || [];
-      renderCurrentCats();
-      const lbl = document.getElementById('setcat-period');
-      if (lbl) lbl.textContent = state.current;
-      schedulePreview();
-    }
-  }
-
-  document.getElementById('setcat-save').addEventListener('click', async () => {
-    const inputs = setcatBody.querySelectorAll('input[data-cat-id]');
-    const byId = {};
-    for (const inp of inputs) {
-      const cid = Number(inp.dataset.catId);
-      if (!byId[cid]) byId[cid] = { id: cid };
-      if (inp.dataset.field === 'name') byId[cid].name = inp.value.trim();
-      else byId[cid].amount = Number(inp.value.trim() || '0');
-    }
-    const categories = Object.values(byId);
-    for (const c of categories) {
-      if (!c.name) {
-        showMsg('setcat-msg', '카테고리명을 비울 수 없습니다.');
-        return;
-      }
-      if (!Number.isInteger(c.amount) || c.amount < 0) {
-        showMsg('setcat-msg', '금액은 0 이상의 정수여야 합니다.');
-        return;
-      }
-    }
-    const { res } = await api(`/api/periods/${state.current}/categories`, {
-      method: 'PUT',
-      body: JSON.stringify({ categories }),
-    });
-    if (res.ok) {
-      showMsg('setcat-msg', '당월 금액 저장됨');
-      await loadCurrentCategories();
-    } else {
-      showMsg('setcat-msg', '저장에 실패했습니다.');
-    }
-  });
-
-  document.getElementById('setcat-add-btn').addEventListener('click', () => {
-    document.getElementById('setcat-modal-name').value = '';
-    document.getElementById('setcat-modal-amount').value = '';
-    showMsg('setcat-modal-msg', '');
-    openModal('setcat-modal');
-  });
-  document.getElementById('setcat-modal-save').addEventListener('click', async () => {
-    const name = document.getElementById('setcat-modal-name').value.trim();
-    const amount = Number(document.getElementById('setcat-modal-amount').value.trim() || '0');
-    if (!name) {
-      showMsg('setcat-modal-msg', '카테고리명을 입력하세요.');
-      return;
-    }
-    if (!Number.isInteger(amount) || amount < 0) {
-      showMsg('setcat-modal-msg', '금액은 0 이상의 정수여야 합니다.');
-      return;
-    }
-    const { res } = await api(`/api/periods/${state.current}/categories`, {
-      method: 'POST',
-      body: JSON.stringify({ name, amount }),
-    });
-    if (res.ok) {
-      closeModal('setcat-modal');
-      await loadCurrentCategories();
-    } else {
-      showMsg('setcat-modal-msg', '추가에 실패했습니다.');
     }
   });
 
@@ -899,16 +880,17 @@
     } catch (_) {
       /* noop */
     }
-    await Promise.all([loadMembers(), loadPerPerson(), loadTemplates()]);
+    await Promise.all([loadMembers(), loadSettings(), loadTemplates()]);
     fillAdjMemberSelect();
-    await loadCurrentCategories();
     await loadAdjustments();
+    schedulePreview();
   }
 
-  // 미리보기 실시간 갱신 배선(디바운스 250ms). 입력은 버블링되므로 컨테이너 위임.
+  // 미리보기 실시간 갱신 배선(디바운스 250ms).
   const perPersonInputEl = document.getElementById('per-person-input');
   if (perPersonInputEl) perPersonInputEl.addEventListener('input', schedulePreview);
-  if (setcatBody) setcatBody.addEventListener('input', schedulePreview);
+  const perMemberInputEl = document.getElementById('per-member-input');
+  if (perMemberInputEl) perMemberInputEl.addEventListener('input', schedulePreview);
 
   // 탭 모듈이 최초 진입 시 호출.
   window.__settings = { load };

@@ -13,7 +13,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getDb, DB_PATH, ensurePeriod } from './db.js';
 import { currentPeriod, isValidPeriod } from './period.js';
-import { computeAllocation } from './budget.js';
+import { computeAllocation, shouldRollbackSurplus } from './budget.js';
 import {
   SESSION_COOKIE,
   signSession,
@@ -197,24 +197,172 @@ function syncCurrentPeriodMemberCount() {
   db.prepare('UPDATE period_meta SET member_count = ? WHERE period = ?').run(n, cur);
 }
 
+// --- 당월 예산 파라미터 스냅샷 동기화 (신규 도메인 모델) --------------------
+// 설정(per_person/per_member_budget/balancing_category) 변경 후 호출. 열려 있는 당월
+// period_meta 스냅샷만 현재 settings로 미러링한다. 과거 월 스냅샷은 절대 건드리지 않는다.
+function syncCurrentPeriodSettings() {
+  const cur = currentPeriod();
+  ensurePeriod(db, cur);
+  const s = db
+    .prepare(
+      'SELECT per_person, per_member_budget, balancing_category FROM settings WHERE id = 1',
+    )
+    .get();
+  db.prepare(
+    `UPDATE period_meta
+        SET per_person = ?, per_member_budget = ?, balancing_category = ?
+      WHERE period = ?`,
+  ).run(s.per_person, s.per_member_budget, s.balancing_category, cur);
+}
+
+// --- 당월 자투리(surplus) 계산 (쓰기 검증 단일 소스) ------------------------
+// surplus = total_budget − common_total − personal_total.
+//   total_budget   = per_person × N(활성 인원)
+//   personal_total = per_member_budget × N + adjustments_total(활성 팀원 조정 합)
+//   common_total   = 당월 period_categories amount 합
+// 개인예산·카테고리·조정 저장 시 이 값이 음수면 예산 초과 → 쓰기 차단(400 over_budget).
+function computeCurrentSurplus() {
+  const cur = currentPeriod();
+  ensurePeriod(db, cur);
+  const s = db
+    .prepare('SELECT per_person, per_member_budget FROM settings WHERE id = 1')
+    .get();
+  const memberCount = db
+    .prepare('SELECT COUNT(*) AS n FROM members WHERE active = 1')
+    .get().n;
+  const commonTotal = db
+    .prepare('SELECT COALESCE(SUM(amount), 0) AS s FROM period_categories WHERE period = ?')
+    .get(cur).s;
+  // 활성 팀원의 조정 합만(비활성 팀원 조정은 수령자가 없어 분배 대상 아님 — allocation과 일치).
+  const adjustmentsTotal = db
+    .prepare(
+      `SELECT COALESCE(SUM(a.amount), 0) AS s
+         FROM adjustments a
+         JOIN members m ON m.id = a.member_id AND m.active = 1
+        WHERE a.period = ?`,
+    )
+    .get(cur).s;
+  const totalBudget = s.per_person * memberCount;
+  const personalTotal = s.per_member_budget * memberCount + adjustmentsTotal;
+  return totalBudget - commonTotal - personalTotal;
+}
+
+// 뮤테이션을 트랜잭션으로 실행하고, 방향-완화 판정으로 surplus를 지킨다.
+// 절대값이 아니라 방향을 본다: 변경 후 음수이고 그 음수가 변경 전보다 더 나빠졌을 때만 롤백한다
+// (shouldRollbackSurplus). 이미 음수인 상태에서 개선/유지하는 편집은 통과시킨다(초기 음수 락아웃 방지).
+// 반환: { ok:true } | { ok:false, error:'over_budget' }. 그 외 예외는 재전파.
+function withSurplusGuard(mutation) {
+  const tx = db.transaction(() => {
+    const before = computeCurrentSurplus();
+    const out = mutation();
+    const after = computeCurrentSurplus();
+    if (shouldRollbackSurplus(before, after)) {
+      const e = new Error('over_budget');
+      e.code = 'OVER_BUDGET';
+      throw e;
+    }
+    return out;
+  });
+  try {
+    const out = tx();
+    return { ok: true, out };
+  } catch (e) {
+    if (e && e.code === 'OVER_BUDGET') return { ok: false, error: 'over_budget' };
+    throw e;
+  }
+}
+
 // period < currentPeriod() 이면 과거 월(쓰기 금지 대상).
 function isPastPeriod(period) {
   return period < currentPeriod();
 }
 
-// --- 설정: 인당 금액 (FR-02 관련, per_person) ------------------------------
+// --- 설정: 예산 파라미터 (per_person / per_member_budget / balancing_category) ---
+// 신규 도메인 모델: 개인 예산은 전원 공통 설정값(per_member_budget), 자투리(surplus)는
+// balancing_category가 흡수한다. 세 값은 부분 업데이트를 허용한다(온 것만 반영).
 app.get('/api/settings', (_req, res) => {
-  const row = db.prepare('SELECT per_person FROM settings WHERE id = 1').get();
-  res.json({ per_person: row ? row.per_person : 0 });
+  const row = db
+    .prepare('SELECT per_person, per_member_budget, balancing_category FROM settings WHERE id = 1')
+    .get();
+  res.json({
+    per_person: row ? row.per_person : 0,
+    per_member_budget: row ? row.per_member_budget : 0,
+    balancing_category: row ? row.balancing_category : null,
+  });
 });
 
 app.put('/api/settings', (req, res) => {
-  const { per_person } = req.body || {};
-  if (!Number.isInteger(per_person) || per_person <= 0) {
-    return res.status(400).json({ ok: false, error: 'invalid per_person' });
+  const body = req.body || {};
+  const has = (k) => Object.prototype.hasOwnProperty.call(body, k);
+
+  // 부분 업데이트: 전달된 필드만 검증·반영. 하나도 없으면 400.
+  if (!has('per_person') && !has('per_member_budget') && !has('balancing_category')) {
+    return res.status(400).json({ ok: false, error: 'no_fields' });
   }
-  db.prepare('UPDATE settings SET per_person = ? WHERE id = 1').run(per_person);
-  return res.json({ ok: true, per_person });
+
+  const sets = [];
+  const params = [];
+  if (has('per_person')) {
+    const v = body.per_person;
+    if (!Number.isInteger(v) || v <= 0) {
+      return res.status(400).json({ ok: false, error: 'invalid per_person' });
+    }
+    sets.push('per_person = ?');
+    params.push(v);
+  }
+  if (has('per_member_budget')) {
+    const v = body.per_member_budget;
+    if (!Number.isInteger(v) || v < 0) {
+      return res.status(400).json({ ok: false, error: 'invalid per_member_budget' });
+    }
+    sets.push('per_member_budget = ?');
+    params.push(v);
+  }
+  if (has('balancing_category')) {
+    const v = body.balancing_category;
+    // 문자열(비어있지 않음) 또는 null 허용.
+    if (v !== null && (typeof v !== 'string' || v.trim() === '')) {
+      return res.status(400).json({ ok: false, error: 'invalid balancing_category' });
+    }
+    // 실재 카테고리 검증: 지정 시 당월 period_categories에 그 이름이 있어야 한다.
+    // (당월 카테고리가 0개인 특수 상황은 예외 허용 — 아직 흡수 대상이 없음.)
+    if (v !== null) {
+      const cur = currentPeriod();
+      ensurePeriod(db, cur);
+      const catCount = db
+        .prepare('SELECT COUNT(*) AS n FROM period_categories WHERE period = ?')
+        .get(cur).n;
+      if (catCount > 0) {
+        const exists = db
+          .prepare('SELECT 1 FROM period_categories WHERE period = ? AND name = ?')
+          .get(cur, v.trim());
+        if (!exists) {
+          return res.status(400).json({ ok: false, error: 'unknown_balancing_category' });
+        }
+      }
+    }
+    sets.push('balancing_category = ?');
+    params.push(v === null ? null : v.trim());
+  }
+
+  // 변경 + surplus 검증 + 당월 스냅샷 동기화를 원자적으로.
+  const guard = withSurplusGuard(() => {
+    db.prepare(`UPDATE settings SET ${sets.join(', ')} WHERE id = 1`).run(...params);
+    syncCurrentPeriodSettings();
+  });
+  if (!guard.ok) {
+    return res.status(400).json({ ok: false, error: guard.error });
+  }
+
+  const row = db
+    .prepare('SELECT per_person, per_member_budget, balancing_category FROM settings WHERE id = 1')
+    .get();
+  return res.json({
+    ok: true,
+    per_person: row.per_person,
+    per_member_budget: row.per_member_budget,
+    balancing_category: row.balancing_category,
+  });
 });
 
 // --- 비밀번호 변경 (FR-01 확장) --------------------------------------------
@@ -291,11 +439,18 @@ app.post('/api/members', (req, res) => {
   if (typeof name !== 'string' || name.trim() === '') {
     return res.status(400).json({ ok: false, error: 'name required' });
   }
-  const info = db
-    .prepare('INSERT INTO members (name, birthday, active) VALUES (?, ?, 1)')
-    .run(name.trim(), birthday || null);
-  syncCurrentPeriodMemberCount();
-  return res.status(201).json({ ok: true, id: info.lastInsertRowid });
+  // 팀원 추가는 N을 늘려 personal_total(=per_member_budget×N+조정)을 키우므로 surplus를
+  // 악화시킬 수 있다. 방향-완화 가드로 감싼다(악화하여 음수면 롤백+400, 개선/유지면 통과).
+  let newId = null;
+  const guard = withSurplusGuard(() => {
+    const info = db
+      .prepare('INSERT INTO members (name, birthday, active) VALUES (?, ?, 1)')
+      .run(name.trim(), birthday || null);
+    newId = info.lastInsertRowid;
+    syncCurrentPeriodMemberCount();
+  });
+  if (!guard.ok) return res.status(400).json({ ok: false, error: guard.error });
+  return res.status(201).json({ ok: true, id: newId });
 });
 
 app.put('/api/members/:id', (req, res) => {
@@ -311,13 +466,17 @@ app.put('/api/members/:id', (req, res) => {
   const newBirthday = birthday !== undefined ? birthday || null : existing.birthday;
   const newActive = active !== undefined ? (active ? 1 : 0) : existing.active;
 
-  db.prepare('UPDATE members SET name = ?, birthday = ?, active = ? WHERE id = ?').run(
-    newName,
-    newBirthday,
-    newActive,
-    id,
-  );
-  syncCurrentPeriodMemberCount();
+  // 재활성(active 0→1)은 N을 늘려 surplus를 악화시킬 수 있다. 방향-완화 가드로 감싼다.
+  const guard = withSurplusGuard(() => {
+    db.prepare('UPDATE members SET name = ?, birthday = ?, active = ? WHERE id = ?').run(
+      newName,
+      newBirthday,
+      newActive,
+      id,
+    );
+    syncCurrentPeriodMemberCount();
+  });
+  if (!guard.ok) return res.status(400).json({ ok: false, error: guard.error });
   return res.json({ ok: true });
 });
 
@@ -334,8 +493,13 @@ app.delete('/api/members/:id', (req, res) => {
     return res.status(409).json({ ok: false, error: 'has_transactions' });
   }
 
-  db.prepare('DELETE FROM members WHERE id = ?').run(id);
-  syncCurrentPeriodMemberCount();
+  // 삭제는 N을 줄인다. per_person>per_member_budget 이면 surplus를 낮춰 악화시킬 수 있으므로
+  // 방향-완화 가드로 감싼다(악화하여 음수면 롤백+400, 개선/유지면 통과).
+  const guard = withSurplusGuard(() => {
+    db.prepare('DELETE FROM members WHERE id = ?').run(id);
+    syncCurrentPeriodMemberCount();
+  });
+  if (!guard.ok) return res.status(400).json({ ok: false, error: guard.error });
   return res.json({ ok: true });
 });
 
@@ -348,19 +512,46 @@ app.get('/api/category-templates', (_req, res) => {
   res.json({ templates: rows });
 });
 
+// 카테고리 편집은 템플릿 + 당월(현재 열린 월) period_categories만 동기화한다.
+// 과거 월 period_categories는 절대 건드리지 않는다(스냅샷 불변). UI는 이 API 하나만 쓴다.
 app.post('/api/category-templates', (req, res) => {
   const { name, default_amount } = req.body || {};
   if (typeof name !== 'string' || name.trim() === '') {
     return res.status(400).json({ ok: false, error: 'name required' });
   }
+  const cleanName = name.trim();
   const amount = default_amount === undefined ? 0 : default_amount;
   if (!Number.isInteger(amount) || amount < 0) {
     return res.status(400).json({ ok: false, error: 'invalid default_amount' });
   }
-  const info = db
-    .prepare('INSERT INTO category_templates (name, default_amount) VALUES (?, ?)')
-    .run(name.trim(), amount);
-  return res.status(201).json({ ok: true, id: info.lastInsertRowid });
+  // 이름 유니크 검증(템플릿 기준).
+  const dup = db.prepare('SELECT id FROM category_templates WHERE name = ?').get(cleanName);
+  if (dup) return res.status(400).json({ ok: false, error: 'duplicate_name' });
+
+  const cur = currentPeriod();
+  ensurePeriod(db, cur);
+
+  // 템플릿 추가 + 당월 period_categories 추가 → surplus<0 이면 롤백(카테고리 추가는 surplus 감소).
+  let newId = null;
+  const guard = withSurplusGuard(() => {
+    const info = db
+      .prepare('INSERT INTO category_templates (name, default_amount) VALUES (?, ?)')
+      .run(cleanName, amount);
+    newId = info.lastInsertRowid;
+    // 당월 스냅샷에도 같은 카테고리를 추가(이미 같은 이름이 있으면 중복 추가 방지).
+    const existsInCur = db
+      .prepare('SELECT id FROM period_categories WHERE period = ? AND name = ?')
+      .get(cur, cleanName);
+    if (!existsInCur) {
+      db.prepare('INSERT INTO period_categories (period, name, amount) VALUES (?, ?, ?)').run(
+        cur,
+        cleanName,
+        amount,
+      );
+    }
+  });
+  if (!guard.ok) return res.status(400).json({ ok: false, error: guard.error });
+  return res.status(201).json({ ok: true, id: newId });
 });
 
 app.put('/api/category-templates/:id', (req, res) => {
@@ -380,19 +571,76 @@ app.put('/api/category-templates/:id', (req, res) => {
     }
     newAmount = default_amount;
   }
-  db.prepare('UPDATE category_templates SET name = ?, default_amount = ? WHERE id = ?').run(
-    newName,
-    newAmount,
-    id,
-  );
+  // 이름 유니크 검증(자기 자신 제외).
+  const dup = db
+    .prepare('SELECT id FROM category_templates WHERE name = ? AND id != ?')
+    .get(newName, id);
+  if (dup) return res.status(400).json({ ok: false, error: 'duplicate_name' });
+
+  const cur = currentPeriod();
+  ensurePeriod(db, cur);
+  const oldName = existing.name;
+
+  // 템플릿 UPDATE + 당월 period_categories(old name 매칭) UPDATE + balancing 이름 추종.
+  const guard = withSurplusGuard(() => {
+    db.prepare('UPDATE category_templates SET name = ?, default_amount = ? WHERE id = ?').run(
+      newName,
+      newAmount,
+      id,
+    );
+    db.prepare(
+      'UPDATE period_categories SET name = ?, amount = ? WHERE period = ? AND name = ?',
+    ).run(newName, newAmount, cur, oldName);
+    // balancing_category가 이 카테고리(old name)를 가리키면 새 이름으로 추종.
+    const s = db.prepare('SELECT balancing_category FROM settings WHERE id = 1').get();
+    if (s && s.balancing_category === oldName && oldName !== newName) {
+      db.prepare('UPDATE settings SET balancing_category = ? WHERE id = 1').run(newName);
+      syncCurrentPeriodSettings();
+    }
+  });
+  if (!guard.ok) return res.status(400).json({ ok: false, error: guard.error });
   return res.json({ ok: true });
 });
 
 app.delete('/api/category-templates/:id', (req, res) => {
   const id = Number(req.params.id);
-  const existing = db.prepare('SELECT id FROM category_templates WHERE id = ?').get(id);
+  const existing = db.prepare('SELECT * FROM category_templates WHERE id = ?').get(id);
   if (!existing) return res.status(404).json({ ok: false, error: 'not found' });
-  db.prepare('DELETE FROM category_templates WHERE id = ?').run(id);
+
+  const cur = currentPeriod();
+  ensurePeriod(db, cur);
+  const delName = existing.name;
+
+  // 당월 스냅샷에서 같은 이름 카테고리에 지출이 있으면 삭제 불가(정합성 보호).
+  const refs = db
+    .prepare(
+      `SELECT COUNT(*) AS n
+         FROM transactions t
+         JOIN period_categories pc ON pc.id = t.period_category_id
+        WHERE t.period = ? AND pc.name = ?`,
+    )
+    .get(cur, delName).n;
+  if (refs > 0) {
+    return res.status(409).json({ ok: false, error: 'has_transactions' });
+  }
+
+  // 삭제는 surplus를 늘리므로 차단 불필요. 템플릿 + 당월 period_categories 삭제, balancing 재지정.
+  const tx = db.transaction(() => {
+    db.prepare('DELETE FROM category_templates WHERE id = ?').run(id);
+    db.prepare('DELETE FROM period_categories WHERE period = ? AND name = ?').run(cur, delName);
+    const s = db.prepare('SELECT balancing_category FROM settings WHERE id = 1').get();
+    if (s && s.balancing_category === delName) {
+      // 남은 당월 카테고리 중 첫 항목(id 오름차순)으로 재지정. 없으면 NULL.
+      const next = db
+        .prepare('SELECT name FROM period_categories WHERE period = ? ORDER BY id LIMIT 1')
+        .get(cur);
+      db.prepare('UPDATE settings SET balancing_category = ? WHERE id = 1').run(
+        next ? next.name : null,
+      );
+      syncCurrentPeriodSettings();
+    }
+  });
+  tx();
   return res.json({ ok: true });
 });
 
@@ -425,13 +673,19 @@ app.put('/api/periods/:period/categories', (req, res) => {
     }
   }
   ensurePeriod(db, period);
-  const upd = db.prepare(
-    'UPDATE period_categories SET name = ?, amount = ? WHERE id = ? AND period = ?',
-  );
-  const tx = db.transaction((rows) => {
-    for (const c of rows) upd.run(c.name.trim(), c.amount, c.id, period);
-  });
-  tx(categories);
+  const applyUpdates = () => {
+    const upd = db.prepare(
+      'UPDATE period_categories SET name = ?, amount = ? WHERE id = ? AND period = ?',
+    );
+    for (const c of categories) upd.run(c.name.trim(), c.amount, c.id, period);
+  };
+  // 당월이면 surplus<0 차단. 미래 월은 당월 surplus와 무관하므로 그대로 반영.
+  if (period === currentPeriod()) {
+    const guard = withSurplusGuard(applyUpdates);
+    if (!guard.ok) return res.status(400).json({ ok: false, error: guard.error });
+  } else {
+    db.transaction(applyUpdates)();
+  }
   return res.json({ ok: true });
 });
 
@@ -453,10 +707,20 @@ app.post('/api/periods/:period/categories', (req, res) => {
     return res.status(400).json({ ok: false, error: 'invalid amount' });
   }
   ensurePeriod(db, period);
-  const info = db
-    .prepare('INSERT INTO period_categories (period, name, amount) VALUES (?, ?, ?)')
-    .run(period, name.trim(), amt);
-  return res.status(201).json({ ok: true, id: info.lastInsertRowid });
+  let newId = null;
+  const insertCat = () => {
+    const info = db
+      .prepare('INSERT INTO period_categories (period, name, amount) VALUES (?, ?, ?)')
+      .run(period, name.trim(), amt);
+    newId = info.lastInsertRowid;
+  };
+  if (period === currentPeriod()) {
+    const guard = withSurplusGuard(insertCat);
+    if (!guard.ok) return res.status(400).json({ ok: false, error: guard.error });
+  } else {
+    db.transaction(insertCat)();
+  }
+  return res.status(201).json({ ok: true, id: newId });
 });
 
 // 당월 카테고리 삭제. transactions 참조 시 409.
@@ -520,10 +784,21 @@ app.post('/api/adjustments', (req, res) => {
   if (!Number.isInteger(amount)) {
     return res.status(400).json({ ok: false, error: 'invalid amount' });
   }
-  const info = db
-    .prepare('INSERT INTO adjustments (period, member_id, label, amount) VALUES (?, ?, ?, ?)')
-    .run(p, member_id, label || null, amount);
-  return res.status(201).json({ ok: true, id: info.lastInsertRowid });
+  let newId = null;
+  const insertAdj = () => {
+    const info = db
+      .prepare('INSERT INTO adjustments (period, member_id, label, amount) VALUES (?, ?, ?, ?)')
+      .run(p, member_id, label || null, amount);
+    newId = info.lastInsertRowid;
+  };
+  // 당월 조정은 surplus<0 차단(개인+공용 초과 방지). 미래 월은 당월 surplus와 무관.
+  if (p === currentPeriod()) {
+    const guard = withSurplusGuard(insertAdj);
+    if (!guard.ok) return res.status(400).json({ ok: false, error: guard.error });
+  } else {
+    db.transaction(insertAdj)();
+  }
+  return res.status(201).json({ ok: true, id: newId });
 });
 
 app.put('/api/adjustments/:id', (req, res) => {
@@ -542,11 +817,19 @@ app.put('/api/adjustments/:id', (req, res) => {
     }
     newAmount = amount;
   }
-  db.prepare('UPDATE adjustments SET label = ?, amount = ? WHERE id = ?').run(
-    newLabel,
-    newAmount,
-    id,
-  );
+  const applyUpdate = () => {
+    db.prepare('UPDATE adjustments SET label = ?, amount = ? WHERE id = ?').run(
+      newLabel,
+      newAmount,
+      id,
+    );
+  };
+  if (existing.period === currentPeriod()) {
+    const guard = withSurplusGuard(applyUpdate);
+    if (!guard.ok) return res.status(400).json({ ok: false, error: guard.error });
+  } else {
+    db.transaction(applyUpdate)();
+  }
   return res.json({ ok: true });
 });
 
@@ -575,12 +858,18 @@ app.get('/api/allocation', (req, res) => {
     return res.status(400).json({ ok: false, error: 'invalid period format' });
   }
   ensurePeriod(db, period);
+  // 당월은 최신 설정을 스냅샷에 미러링(과거 월은 불변).
+  if (period === currentPeriod()) syncCurrentPeriodSettings();
 
   const meta = db
-    .prepare('SELECT member_count FROM period_meta WHERE period = ?')
+    .prepare(
+      'SELECT member_count, per_person, per_member_budget, balancing_category FROM period_meta WHERE period = ?',
+    )
     .get(period);
   const memberCount = meta ? meta.member_count : 0;
-  const perPerson = db.prepare('SELECT per_person FROM settings WHERE id = 1').get().per_person;
+  const perPerson = meta && meta.per_person != null ? meta.per_person : 0;
+  const perMemberBudget = meta && meta.per_member_budget != null ? meta.per_member_budget : 0;
+  const balancingCategory = meta ? meta.balancing_category : null;
   const commonTotal = db
     .prepare('SELECT COALESCE(SUM(amount), 0) AS s FROM period_categories WHERE period = ?')
     .get(period).s;
@@ -615,25 +904,35 @@ app.get('/api/allocation', (req, res) => {
     perPerson,
     memberCount,
     commonTotal,
+    perMemberBudget,
     adjustmentsTotal,
     memberAdjustments,
   });
 
-  return res.json({ period, per_person: perPerson, member_count: memberCount, ...result });
+  return res.json({
+    period,
+    per_person: perPerson,
+    member_count: memberCount,
+    balancing_category: balancingCategory,
+    ...result,
+  });
 });
 
 // POST /api/allocation/preview
-// body: { per_person, member_count, common_total, adjustments_total } (비영속 초안값)
+// body: { per_person, member_count, common_total, per_member_budget, adjustments_total } (비영속 초안값)
 // 설정 화면 실시간 미리보기용. 동일 computeAllocation의 aggregate만 계산해 반환한다
 // (클라이언트 산식 중복 금지 — 단일 소스).
 app.post('/api/allocation/preview', (req, res) => {
-  const { per_person, member_count, common_total, adjustments_total } = req.body || {};
+  const { per_person, member_count, common_total, per_member_budget, adjustments_total } =
+    req.body || {};
 
-  // 입력 방어: per_person·member_count·common_total은 0 이상 정수, adjustments_total은 ± 정수.
+  // 입력 방어: per_person·member_count·common_total·per_member_budget은 0 이상 정수,
+  // adjustments_total은 ± 정수.
   if (
     !Number.isInteger(per_person) || per_person < 0 ||
     !Number.isInteger(member_count) || member_count < 0 ||
     !Number.isInteger(common_total) || common_total < 0 ||
+    !Number.isInteger(per_member_budget) || per_member_budget < 0 ||
     !Number.isInteger(adjustments_total)
   ) {
     return res.status(400).json({ ok: false, error: 'invalid preview input' });
@@ -643,15 +942,18 @@ app.post('/api/allocation/preview', (req, res) => {
     perPerson: per_person,
     memberCount: member_count,
     commonTotal: common_total,
+    perMemberBudget: per_member_budget,
     adjustmentsTotal: adjustments_total,
     memberAdjustments: [],
   });
 
   return res.json({
     total_budget: result.total_budget,
-    distributable: result.distributable,
-    base_allocation: result.base_allocation,
-    remainder: result.remainder,
+    common_total: result.common_total,
+    per_member_budget: result.per_member_budget,
+    personal_total: result.personal_total,
+    surplus: result.surplus,
+    effective_common_total: result.effective_common_total,
     warning: result.warning,
   });
 });
@@ -934,38 +1236,21 @@ app.get('/api/dashboard', (req, res) => {
     return res.status(400).json({ ok: false, error: 'invalid period format' });
   }
   ensurePeriod(db, period);
+  // 당월은 최신 설정을 스냅샷에 미러링(과거 월은 불변).
+  if (period === currentPeriod()) syncCurrentPeriodSettings();
 
   const meta = db
-    .prepare('SELECT member_count FROM period_meta WHERE period = ?')
+    .prepare(
+      'SELECT member_count, per_person, per_member_budget, balancing_category FROM period_meta WHERE period = ?',
+    )
     .get(period);
   const memberCount = meta ? meta.member_count : 0;
-  const perPerson = db.prepare('SELECT per_person FROM settings WHERE id = 1').get().per_person;
+  const perPerson = meta && meta.per_person != null ? meta.per_person : 0;
+  const perMemberBudget = meta && meta.per_member_budget != null ? meta.per_member_budget : 0;
+  const balancingCategory = meta ? meta.balancing_category : null;
   const commonTotal = db
     .prepare('SELECT COALESCE(SUM(amount), 0) AS s FROM period_categories WHERE period = ?')
     .get(period).s;
-
-  // --- 카테고리(공용) 집계: 스냅샷 배정 − 그 카테고리 공용 지출 합 -----------
-  const categories = db
-    .prepare(
-      `SELECT pc.id AS id, pc.name AS name, pc.amount AS allocated,
-              COALESCE(
-                (SELECT SUM(t.amount) FROM transactions t
-                  WHERE t.kind = 'common' AND t.period = ? AND t.period_category_id = pc.id),
-                0
-              ) AS used
-         FROM period_categories pc
-        WHERE pc.period = ?
-        ORDER BY pc.id`,
-    )
-    .all(period, period)
-    .map((c) => ({
-      id: c.id,
-      name: c.name,
-      allocated: c.allocated,
-      used: c.used,
-      remaining: c.allocated - c.used, // used>allocated 이면 음수(초과)
-      ratio: c.allocated > 0 ? c.used / c.allocated : 0,
-    }));
 
   // --- 개인 할당: GET /api/allocation과 동일 로직(computeAllocation 단일 소스) -
   // 당월은 active 팀원별 조정 합으로 상세를 산출하고, 그 합을 adjustments_total로 써 불변식을 보증한다.
@@ -996,9 +1281,48 @@ app.get('/api/dashboard', (req, res) => {
     perPerson,
     memberCount,
     commonTotal,
+    perMemberBudget,
     adjustmentsTotal,
     memberAdjustments,
   });
+  const surplus = alloc.surplus;
+
+  // --- 카테고리(공용) 집계: 스냅샷 배정 − 그 카테고리 공용 지출 합 -----------
+  // 자투리(surplus)는 balancing 카테고리(name === balancingCategory)의 배정액에 가산한다.
+  // balancing 카테고리가 없으면 surplus는 어디에도 실리지 않는다(경고 로그).
+  let balancingMatched = false;
+  const categories = db
+    .prepare(
+      `SELECT pc.id AS id, pc.name AS name, pc.amount AS allocated,
+              COALESCE(
+                (SELECT SUM(t.amount) FROM transactions t
+                  WHERE t.kind = 'common' AND t.period = ? AND t.period_category_id = pc.id),
+                0
+              ) AS used
+         FROM period_categories pc
+        WHERE pc.period = ?
+        ORDER BY pc.id`,
+    )
+    .all(period, period)
+    .map((c) => {
+      const isBalancing = balancingCategory != null && c.name === balancingCategory;
+      if (isBalancing) balancingMatched = true;
+      const allocated = c.allocated + (isBalancing ? surplus : 0);
+      return {
+        id: c.id,
+        name: c.name,
+        allocated,
+        used: c.used,
+        remaining: allocated - c.used, // used>allocated 이면 음수(초과)
+        ratio: allocated > 0 ? c.used / allocated : 0,
+      };
+    });
+  if (balancingCategory != null && !balancingMatched && surplus !== 0) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[dashboard] balancing_category '${balancingCategory}'가 당월 카테고리에 없어 surplus(${surplus})가 어디에도 반영되지 않습니다.`,
+    );
+  }
 
   // --- 팀원(개인) 집계: 각 팀원 할당 final − 그 팀원 개인 지출 합 -------------
   // 과거 월은 alloc.members가 빈 배열이므로 members도 빈 배열(상세 미제공, categories/totals/cards만 정확).
@@ -1068,8 +1392,13 @@ app.get('/api/dashboard', (req, res) => {
       overall_ratio: totalBudget > 0 ? usedTotal / totalBudget : 0,
     },
     cards: { card1, card2, none: cardNone },
-    distributable: alloc.distributable,
-    base_allocation: alloc.base_allocation,
+    per_member_budget: perMemberBudget,
+    balancing_category: balancingCategory,
+    // balancing 카테고리가 당월 카테고리에 없어 surplus가 어디에도 안 실린 경우 은폐 방지 플래그.
+    balancing_unmatched: balancingCategory != null && !balancingMatched,
+    personal_total: alloc.personal_total,
+    surplus,
+    effective_common_total: alloc.effective_common_total,
     adjustments_total: alloc.adjustments_total,
     invariant_ok: alloc.invariant_ok,
     warning: alloc.warning,

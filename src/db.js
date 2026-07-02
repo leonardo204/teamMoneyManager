@@ -18,6 +18,14 @@ const DB_PATH = process.env.DB_PATH || path.join(DATA_DIR, 'app.db');
 // 인당 기본 금액 시드 (PRD 4.3 settings.per_person).
 const DEFAULT_PER_PERSON = 180000;
 
+// 개인 예산(전원 공통) 기본값 시드 (PRD 2.2, settings.per_member_budget).
+// 신규 도메인 모델: 개인 예산은 "잔여값 자동계산"이 아니라 전원 공통 설정값이다.
+const DEFAULT_PER_MEMBER_BUDGET = 0;
+
+// 자투리(surplus) 흡수 카테고리 기본값 (settings.balancing_category).
+// 총예산에서 카테고리 합·개인예산합을 뺀 자투리를 이 카테고리가 흡수한다.
+const DEFAULT_BALANCING_CATEGORY = '야근';
+
 // 초기 카테고리 템플릿 시드 (PRD 6장 확정 정책).
 const DEFAULT_CATEGORY_TEMPLATES = [
   { name: '야근', default_amount: 400000 },
@@ -50,9 +58,11 @@ export function initSchema(db) {
     --   최초 기동 시 ensurePasswordHash()가 env(APP_PASSWORD_HASH)로 1회 부트스트랩.
     --   기존 DB에는 아래 마이그레이션(ensurePasswordColumn)이 컬럼을 멱등 추가한다.
     CREATE TABLE IF NOT EXISTS settings (
-      id             INTEGER PRIMARY KEY CHECK (id = 1),
-      per_person     INTEGER NOT NULL DEFAULT 180000,
-      password_hash  TEXT                          -- nullable: NULL이면 로그인 fail-closed
+      id                 INTEGER PRIMARY KEY CHECK (id = 1),
+      per_person         INTEGER NOT NULL DEFAULT 180000,
+      per_member_budget  INTEGER NOT NULL DEFAULT 0,   -- 개인 예산(전원 공통 설정값, PRD 2.2)
+      balancing_category TEXT,                          -- 자투리(surplus) 흡수 카테고리명(기본 '야근')
+      password_hash      TEXT                          -- nullable: NULL이면 로그인 fail-closed
     );
 
     -- members: 월과 무관하게 유지되는 팀원 명단.
@@ -71,10 +81,15 @@ export function initSchema(db) {
       default_amount  INTEGER NOT NULL DEFAULT 0
     );
 
-    -- period_meta: 월 시작 시점 인원 스냅샷(2.4).
+    -- period_meta: 월 시작 시점 스냅샷(2.4). 인원 + 예산 파라미터를 월 시작 시점 값으로 고정한다.
+    -- per_person/per_member_budget/balancing_category는 그 월의 산식에 쓰이는 스냅샷 값이며,
+    -- 과거 월은 불변(집계 불변성). 당월만 syncCurrentPeriodSettings로 현재 settings와 동기화한다.
     CREATE TABLE IF NOT EXISTS period_meta (
-      period        TEXT PRIMARY KEY,       -- 'YYYY-MM'
-      member_count  INTEGER NOT NULL DEFAULT 0
+      period             TEXT PRIMARY KEY,       -- 'YYYY-MM'
+      member_count       INTEGER NOT NULL DEFAULT 0,
+      per_person         INTEGER,                -- 월 시작 스냅샷(NULL이면 마이그레이션 백필 대상)
+      per_member_budget  INTEGER,                -- 월 시작 스냅샷
+      balancing_category TEXT                    -- 월 시작 스냅샷
     );
 
     -- period_categories: 해당 월의 공용 카테고리 스냅샷.
@@ -135,6 +150,68 @@ export function ensurePasswordColumn(db) {
 }
 
 /**
+ * 기존 DB 마이그레이션(멱등): 신규 예산 모델 컬럼을 안전하게 추가·백필한다.
+ * - settings: per_member_budget / balancing_category 없으면 ALTER ADD.
+ *   balancing_category는 NULL로 추가 후 기본값('야근')으로 UPDATE.
+ * - period_meta: per_person / per_member_budget / balancing_category 없으면 ALTER ADD.
+ *   기존 행은 현재 settings 값으로 백필(과거 월 스냅샷이 NULL이면 최신 설정으로 채움).
+ * 구 스키마(이 컬럼들 없음)로 만든 DB를 최신 스키마로 안전하게 올린다.
+ * @param {Database.Database} db
+ */
+export function ensureBudgetColumns(db) {
+  // --- settings ---
+  const sCols = db.prepare('PRAGMA table_info(settings)').all();
+  const hasPerMember = sCols.some((c) => c.name === 'per_member_budget');
+  const hasBalancing = sCols.some((c) => c.name === 'balancing_category');
+  if (!hasPerMember) {
+    db.exec('ALTER TABLE settings ADD COLUMN per_member_budget INTEGER NOT NULL DEFAULT 0');
+  }
+  if (!hasBalancing) {
+    db.exec('ALTER TABLE settings ADD COLUMN balancing_category TEXT');
+    // 기존 단일 설정 행에 기본 balancing 카테고리를 채운다(NULL만).
+    db.prepare(
+      'UPDATE settings SET balancing_category = ? WHERE id = 1 AND balancing_category IS NULL',
+    ).run(DEFAULT_BALANCING_CATEGORY);
+  }
+
+  // --- period_meta ---
+  const pCols = db.prepare('PRAGMA table_info(period_meta)').all();
+  const hasPerPerson = pCols.some((c) => c.name === 'per_person');
+  const hasPmPerMember = pCols.some((c) => c.name === 'per_member_budget');
+  const hasPmBalancing = pCols.some((c) => c.name === 'balancing_category');
+  if (!hasPerPerson) {
+    db.exec('ALTER TABLE period_meta ADD COLUMN per_person INTEGER');
+  }
+  if (!hasPmPerMember) {
+    db.exec('ALTER TABLE period_meta ADD COLUMN per_member_budget INTEGER');
+  }
+  if (!hasPmBalancing) {
+    db.exec('ALTER TABLE period_meta ADD COLUMN balancing_category TEXT');
+  }
+
+  // 신규 컬럼을 추가했다면 기존 period_meta 행을 현재 settings 값으로 백필한다.
+  if (!hasPerPerson || !hasPmPerMember || !hasPmBalancing) {
+    const s = db
+      .prepare(
+        'SELECT per_person, per_member_budget, balancing_category FROM settings WHERE id = 1',
+      )
+      .get();
+    if (s) {
+      db.prepare(
+        `UPDATE period_meta
+            SET per_person = COALESCE(per_person, ?),
+                per_member_budget = COALESCE(per_member_budget, ?),
+                balancing_category = COALESCE(balancing_category, ?)`,
+      ).run(
+        s.per_person,
+        s.per_member_budget != null ? s.per_member_budget : DEFAULT_PER_MEMBER_BUDGET,
+        s.balancing_category != null ? s.balancing_category : DEFAULT_BALANCING_CATEGORY,
+      );
+    }
+  }
+}
+
+/**
  * 로그인 비밀번호 해시 부트스트랩(멱등, 기동 시 1회).
  * settings.password_hash가 NULL일 때만 env(APP_PASSWORD_HASH)로 채운다.
  * - 이미 값이 있으면 env로 절대 덮어쓰지 않는다(설정 화면 변경분 보존).
@@ -161,7 +238,9 @@ export function seedDefaults(db) {
   // settings 단일 행 시드.
   const hasSettings = db.prepare('SELECT COUNT(*) AS n FROM settings').get().n;
   if (hasSettings === 0) {
-    db.prepare('INSERT INTO settings (id, per_person) VALUES (1, ?)').run(DEFAULT_PER_PERSON);
+    db.prepare(
+      'INSERT INTO settings (id, per_person, per_member_budget, balancing_category) VALUES (1, ?, ?, ?)',
+    ).run(DEFAULT_PER_PERSON, DEFAULT_PER_MEMBER_BUDGET, DEFAULT_BALANCING_CATEGORY);
   }
 
   // category_templates 시드(비어 있을 때만).
@@ -201,10 +280,23 @@ export function ensurePeriod(db, period) {
       .prepare('SELECT COUNT(*) AS n FROM members WHERE active = 1')
       .get().n;
 
-    db.prepare('INSERT INTO period_meta (period, member_count) VALUES (?, ?)').run(
-      p,
-      memberCount
-    );
+    // 그 시점의 예산 파라미터 스냅샷(per_person/per_member_budget/balancing_category).
+    const s = db
+      .prepare(
+        'SELECT per_person, per_member_budget, balancing_category FROM settings WHERE id = 1',
+      )
+      .get();
+    const perPerson = s ? s.per_person : DEFAULT_PER_PERSON;
+    const perMemberBudget =
+      s && s.per_member_budget != null ? s.per_member_budget : DEFAULT_PER_MEMBER_BUDGET;
+    const balancingCategory =
+      s && s.balancing_category != null ? s.balancing_category : DEFAULT_BALANCING_CATEGORY;
+
+    db.prepare(
+      `INSERT INTO period_meta
+         (period, member_count, per_person, per_member_budget, balancing_category)
+       VALUES (?, ?, ?, ?, ?)`,
+    ).run(p, memberCount, perPerson, perMemberBudget, balancingCategory);
 
     // 그 시점의 category_templates 전체를 period_categories로 복사(공용 카테고리 스냅샷).
     const templates = db
@@ -233,9 +325,17 @@ export function getDb() {
   _db = new Database(DB_PATH);
   initSchema(_db);
   ensurePasswordColumn(_db); // 기존 DB 마이그레이션(멱등).
+  ensureBudgetColumns(_db); // 신규 예산 모델 컬럼 마이그레이션(멱등).
   seedDefaults(_db);
   ensurePasswordHash(_db); // env로 최초 1회 부트스트랩(있을 때).
   return _db;
 }
 
-export { DB_PATH, DATA_DIR, DEFAULT_PER_PERSON, DEFAULT_CATEGORY_TEMPLATES };
+export {
+  DB_PATH,
+  DATA_DIR,
+  DEFAULT_PER_PERSON,
+  DEFAULT_PER_MEMBER_BUDGET,
+  DEFAULT_BALANCING_CATEGORY,
+  DEFAULT_CATEGORY_TEMPLATES,
+};
