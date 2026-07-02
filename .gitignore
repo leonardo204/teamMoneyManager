@@ -13,6 +13,8 @@
 # Node / app
 node_modules/
 data/
+# DB 볼륨 백업 아카이브(운영 배포 시 생성) — repo 미추적
+app-db-*.tar.gz
 .env
 .env.*
 !.env.example
