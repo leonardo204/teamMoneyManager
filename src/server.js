@@ -1226,6 +1226,7 @@ app.get('/api/audit-logs', (req, res) => {
 //     remaining = allocation − used, ratio = used/allocation(0이면 0).
 //   전체: total_budget = per_person×N, used_total = 공용+개인, overall_ratio = used_total/total_budget(소진율).
 //   카드(FR-10): 그 period 전체 지출을 card(1/2/null)로 합산.
+//   생일 배너: 조회 period의 월(MM)과 생일 월이 일치하는 active 팀원 [{name, birthday}](일 오름차순) → birthday_members.
 //
 // period 처리: 카테고리·totals·cards는 어느 period든 period_categories + transactions로 정확히 계산한다.
 // 팀원별 상세(members)는 당월만 산출한다(과거 월은 active 명단 스냅샷이 없어 신뢰 불가) →
@@ -1376,6 +1377,25 @@ app.get('/api/dashboard', (req, res) => {
     )
     .get(period).s;
 
+  // --- 생일 배너: 조회 period의 월과 생일 월이 일치하는 active 팀원 -----------
+  // birthday(members.birthday)는 형식 검증 없이 저장되므로 방어적으로 파싱한다:
+  // YYYY-MM-DD 매칭에 실패한 값은 해당 팀원을 제외한다. 일(day) 오름차순 정렬.
+  // 표시 여부(당월 조회 한정)는 클라이언트가 period===당월 여부로 판단한다.
+  const periodMonth = period.slice(5, 7); // 'MM'
+  const birthdayMembers = db
+    .prepare(
+      'SELECT name, birthday FROM members WHERE active = 1 AND birthday IS NOT NULL ORDER BY id',
+    )
+    .all()
+    .map((m) => {
+      const bd = /^\d{4}-(\d{2})-(\d{2})$/.exec(m.birthday);
+      if (!bd) return null; // 형식 불일치 → 제외
+      return { name: m.name, birthday: m.birthday, month: bd[1], day: Number(bd[2]) };
+    })
+    .filter((m) => m !== null && m.month === periodMonth)
+    .sort((a, b) => a.day - b.day)
+    .map((m) => ({ name: m.name, birthday: m.birthday }));
+
   return res.json({
     period,
     per_person: perPerson,
@@ -1383,6 +1403,7 @@ app.get('/api/dashboard', (req, res) => {
     total_budget: totalBudget,
     categories,
     members,
+    birthday_members: birthdayMembers,
     totals: {
       allocated_common: commonTotal,
       used_common: usedCommon,
