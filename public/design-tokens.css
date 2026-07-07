@@ -110,6 +110,19 @@ body {
 .badge-warn { background: rgba(178, 94, 0, 0.12); color: var(--warn); }
 .badge-danger { background: rgba(198, 40, 40, 0.12); color: var(--danger); }
 
+/* ---- birthday banner ----------------------------------------------------- */
+/* 대시보드 최상단 생일 축하 배너. .panel/.chip 톤에 맞춘 가로형(토큰 색만). */
+.birthday-banner {
+  display: flex; align-items: center; gap: 0.5rem;
+  margin-top: 1.1rem; padding: 0.7rem 1rem;
+  background: var(--accent-soft); color: var(--accent);
+  border: 1px solid var(--accent); border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card);
+  font-size: 0.9rem; font-weight: 600;
+}
+/* display를 지정했으므로 hidden 무력화를 막는 가드(.modal-overlay[hidden]과 동일 패턴). */
+.birthday-banner[hidden] { display: none; }
+
 /* status dot */
 .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--faint); display: inline-block; }
 .dot.ok { background: var(--ok); }

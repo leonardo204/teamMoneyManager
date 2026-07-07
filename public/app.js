@@ -1544,6 +1544,44 @@
     }
   }
 
+  // 클라이언트 로컬 시각 기준 당월('YYYY-MM'). 서버 currentPeriod()와 동일 규칙.
+  function currentMonth() {
+    const now = new Date();
+    const y = now.getFullYear();
+    const m = String(now.getMonth() + 1).padStart(2, '0');
+    return `${y}-${m}`;
+  }
+
+  // ---- 생일 축하 배너 ----
+  // 당월(period === 현재 월)을 조회 중이고 그 달 생일 활성 팀원이 1명 이상일 때만 표시.
+  // 과거/다른 월 조회 시엔 hidden 복원. 이름은 사용자 입력이므로 textContent로만 조립(XSS 방지).
+  function renderBirthdayBanner(d, period) {
+    const banner = document.getElementById('birthday-banner');
+    if (!banner) return;
+    const list = Array.isArray(d.birthday_members) ? d.birthday_members : [];
+    if (period !== currentMonth() || list.length === 0) {
+      banner.hidden = true;
+      banner.textContent = '';
+      return;
+    }
+    // birthday(YYYY-MM-DD)에서 월/일을 뽑아 앞자리 0 제거(07/05 → 7/5). 형식 이상은 제외.
+    const parts = [];
+    for (const m of list) {
+      const bd = /^\d{4}-(\d{2})-(\d{2})$/.exec(m.birthday || '');
+      if (!bd) continue;
+      const mm = Number(bd[1]);
+      const dd = Number(bd[2]);
+      parts.push(`${m.name} (${mm}/${dd})`);
+    }
+    if (parts.length === 0) {
+      banner.hidden = true;
+      banner.textContent = '';
+      return;
+    }
+    banner.textContent = `🎂 이번 달 생일자: ${parts.join(', ')}`;
+    banner.hidden = false;
+  }
+
   // 마지막 렌더 기간(탭 재진입 refresh용).
   let lastPeriod = null;
 
@@ -1556,6 +1594,7 @@
       renderSummary(data);
       renderCategoryCards(data);
       renderMemberTable(data);
+      renderBirthdayBanner(data, period);
     } catch (err) {
       // eslint-disable-next-line no-console
       console.error('[dashboard] render failed:', err);
